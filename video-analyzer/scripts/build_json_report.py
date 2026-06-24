@@ -10,7 +10,10 @@ Usage:
         --character-names '{"1":"Gioggia","2":"Antoni"}'       # optional, from Claude's vision pass
         --summary "Overall summary text"
 
-Reads: metadata.json, transcript.txt, characters.json, manifest.json
+Reads: metadata.json, transcript.txt, clusters.json (optional), manifest.json
+Characters and their count come from Claude Vision (passed via --character-names).
+clusters.json is optional; if absent, the characters section is populated from
+--character-names alone.
 Outputs: single structured JSON file
 """
 import argparse
@@ -44,7 +47,7 @@ def read_text(path):
 
 metadata    = read_json(os.path.join(args.work_dir, "metadata.json"))
 manifest    = read_json(os.path.join(args.work_dir, "manifest.json"))
-characters  = read_json(os.path.join(args.work_dir, "characters.json"))
+clusters    = read_json(os.path.join(args.work_dir, "clusters.json"))
 transcript_raw = read_text(os.path.join(args.work_dir, "transcript.txt"))
 
 # Parse transcript into structured segments
@@ -63,11 +66,13 @@ visual_timeline = json.loads(args.visual_timeline) if args.visual_timeline else 
 character_names = json.loads(args.character_names) if args.character_names else {}
 key_observations = json.loads(args.key_observations) if args.key_observations else []
 
-# Enrich character list with names if provided
-char_list = characters.get("characters", [])
-for c in char_list:
-    cid = str(c.get("character_id", ""))
-    c["name"] = character_names.get(cid, f"Character {cid}")
+# Build character list from Claude Vision names (--character-names).
+# Empty dict means either "skipped" or "zero characters found" — both yield an empty list.
+# Cluster data is a frame-selection aid only; it does not identify characters.
+char_list = []
+if character_names:
+    for cid_str, name in sorted(character_names.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+        char_list.append({"character_id": int(cid_str) if cid_str.isdigit() else cid_str, "name": name})
 
 # ── Assemble report ───────────────────────────────────────────────────────────
 report = {
@@ -75,7 +80,8 @@ report = {
     "generated_by": "video-analyzer skill",
     "metadata": metadata,
     "characters": {
-        "count": characters.get("character_count_detected", 0),
+        "count": len(char_list),
+        "count_source": "claude_vision" if character_names else "not_provided",
         "list": char_list,
     },
     "audio": {
@@ -96,6 +102,6 @@ with open(args.output, "w", encoding="utf-8") as f:
     json.dump(report, f, indent=2, ensure_ascii=False)
 
 print(f"✅ JSON report written to {args.output}")
-print(f"   Characters : {report['characters']['count']}")
+print(f"   Characters : {report['characters']['count']} ({report['characters']['count_source']})")
 print(f"   Transcript : {len(transcript_segments)} segments")
 print(f"   Timeline   : {len(visual_timeline)} entries")

@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-detect_characters.py — Visual character clustering for the video-analyzer skill.
+cluster_frames.py — Visual scene clustering for the video-analyzer skill.
+
+Groups extracted frames by color/composition similarity (HSV histogram) to
+identify visually distinct scene groups and select representative frames.
+This is a frame-selection aid, NOT a character detector or face recognizer.
 
 Usage:
-    python3 detect_characters.py --frames-dir /tmp/video_work/frames \
-                                  --output /tmp/video_work/characters.json \
-                                  --manifest /tmp/video_work/manifest.json
+    python3 cluster_frames.py --frames-dir /tmp/video_work/frames \
+                               --output /tmp/video_work/clusters.json \
+                               --manifest /tmp/video_work/manifest.json
 
 Strategy:
-  1. For each frame: extract dominant color regions from the top-half (character area)
-  2. Build a color histogram fingerprint per frame
-  3. Cluster frames by histogram similarity → each cluster = one recurring "character slot"
-  4. Pick the most representative frame per cluster
-  5. Output a characters.json with: count, clusters, representative_frame paths
+  1. For each frame: extract HSV histogram from the central region
+  2. Greedy clustering by histogram correlation — frames above threshold
+     land in the same visual cluster
+  3. Pick the most representative frame per cluster
+  4. Output clusters.json with: visual_cluster_count, clusters,
+     representative_frame paths (use these to pick frames for Claude Vision)
 """
 
 import argparse
@@ -28,7 +33,7 @@ parser.add_argument("--frames-dir", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--manifest", required=True)
 parser.add_argument("--similarity-threshold", type=float, default=0.72,
-                    help="Histogram correlation threshold (0-1). Higher = stricter.")
+                    help="Histogram correlation threshold (0-1). Higher = stricter grouping.")
 args = parser.parse_args()
 
 # ── Load manifest ─────────────────────────────────────────────────────────────
@@ -46,7 +51,6 @@ def frame_fingerprint(path):
     if img is None:
         return None
     h, w = img.shape[:2]
-    # Focus on center 60% of image width, top 70% of height (character body area)
     roi = img[0:int(h * 0.70), int(w * 0.20):int(w * 0.80)]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     # 3-channel histogram: H(18 bins), S(8 bins), V(8 bins)
@@ -68,12 +72,11 @@ clusters = []  # list of {representative, members: [paths], timestamps: [...]}
 manifest_by_path = {e["path"]: e for e in manifest}
 
 def hist_corr(a, b):
-    # Reshape back to 3D for compareHist
     h1 = a.reshape(18, 8, 8).astype(np.float32)
     h2 = b.reshape(18, 8, 8).astype(np.float32)
     return cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL)
 
-print("Clustering frames into character groups…", flush=True)
+print("Clustering frames by visual similarity…", flush=True)
 threshold = args.similarity_threshold
 
 for path in frame_paths:
@@ -92,25 +95,27 @@ for path in frame_paths:
             break
     if not matched:
         clusters.append({
-            "character_id": len(clusters) + 1,
+            "cluster_id": len(clusters) + 1,
             "representative": path,
             "representative_timestamp": manifest_by_path.get(path, {}).get("timestamp_formatted", "?"),
             "members": [path],
             "timestamps": [manifest_by_path.get(path, {}).get("timestamp_formatted", "?")],
         })
 
-# Sort clusters by number of appearances (most frequent first)
+# Sort clusters by number of frames (largest first)
 clusters.sort(key=lambda c: len(c["members"]), reverse=True)
 for i, c in enumerate(clusters):
-    c["character_id"] = i + 1
+    c["cluster_id"] = i + 1
 
 # ── Output ────────────────────────────────────────────────────────────────────
 result = {
-    "character_count_detected": len(clusters),
-    "characters": [
+    "visual_cluster_count": len(clusters),
+    "note": "Clusters are grouped by color/composition similarity — not by identity. "
+            "Use representative_frame paths to pick frames for Claude Vision.",
+    "clusters": [
         {
-            "character_id": c["character_id"],
-            "appearances": len(c["members"]),
+            "cluster_id": c["cluster_id"],
+            "frame_count": len(c["members"]),
             "first_seen": c["timestamps"][0] if c["timestamps"] else "?",
             "last_seen": c["timestamps"][-1] if c["timestamps"] else "?",
             "representative_frame": c["representative"],
@@ -124,7 +129,8 @@ result = {
 with open(args.output, "w") as f:
     json.dump(result, f, indent=2)
 
-print(f"\n✅ Detected {len(clusters)} distinct visual character(s).", flush=True)
+print(f"\n✅ Found {len(clusters)} visual cluster(s) (color/composition grouping).", flush=True)
 for c in clusters:
-    print(f"   Character {c['character_id']}: {len(c['members'])} frames "
+    print(f"   Cluster {c['cluster_id']}: {len(c['members'])} frames "
           f"(first: {c['timestamps'][0] if c['timestamps'] else '?'})", flush=True)
+print("\nNote: cluster count is a scene-grouping estimate, not a character count.", flush=True)

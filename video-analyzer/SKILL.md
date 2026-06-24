@@ -19,8 +19,12 @@ compatibility: >
 
 Converts a video file into a complete, structured report (Markdown **and** JSON) that
 captures everything an AI or human needs to understand the video without watching it.
-Includes automatic character detection, audio transcription (Whisper), and visual
-analysis of key frames.
+Includes audio transcription (Whisper), visual frame analysis (Claude Vision), and
+optional scene clustering to aid frame selection.
+
+**Token cost estimates** (choose your mode):
+- **Character-counting pass only** (5–8 frames): ~8–12k vision tokens
+- **Full frame-by-frame timeline** (up to 30 frames): ~40k+ vision tokens
 
 ---
 
@@ -48,6 +52,9 @@ python3 /home/claude/video-analyzer/scripts/process_video.py \
     --model base
 ```
 
+Frames are resized so the long edge is at most **1568 px** (aspect ratio preserved).
+This keeps vision token cost predictable at roughly ~1,400 tokens/frame.
+
 **Parameter guide:**
 
 | Parameter | Default | When to change |
@@ -58,36 +65,47 @@ python3 /home/claude/video-analyzer/scripts/process_video.py \
 
 ---
 
-## Step 2 — Run character detection
+## Step 2 — (Optional) Run visual scene clustering
+
+This step groups frames by color/composition similarity to help you pick
+representative frames for Claude Vision. It is **not** a character detector —
+it uses HSV histograms, not face recognition. Skip this step if you prefer
+to select frames manually.
 
 ```bash
-python3 /home/claude/video-analyzer/scripts/detect_characters.py \
+python3 /home/claude/video-analyzer/scripts/cluster_frames.py \
     --frames-dir /tmp/video_work/frames \
-    --output /tmp/video_work/characters.json \
-    --manifest /tmp/video_work/manifest.json
+    --output /tmp/video_work/clusters.json \
+    --manifest /tmp/video_work/manifest.json \
+    --similarity-threshold 0.72
 ```
 
-This clusters all frames by visual similarity (HSV histogram) and outputs
-`characters.json` with: `character_count_detected`, a list of character slots
-each with `appearances`, `first_seen`, `last_seen`, and a `representative_frame` path.
+The output `clusters.json` contains `visual_cluster_count` (a rough grouping
+estimate) and a `representative_frame` path per cluster. Use these paths to
+choose the 5–8 frames for the character-counting pass below.
+
+**Tuning `--similarity-threshold`:**
+- Too many clusters (>8 for a simple video): raise to 0.80
+- Too few clusters (everything merged): lower to 0.60
 
 ---
 
-## Step 3 — Read metadata, transcript, characters
+## Step 3 — Read metadata, transcript, and cluster data
 
 ```bash
 cat /tmp/video_work/metadata.json
 cat /tmp/video_work/transcript.txt
-cat /tmp/video_work/characters.json
+cat /tmp/video_work/clusters.json   # omit if Step 2 was skipped
 cat /tmp/video_work/manifest.json
 ```
 
 ---
 
-## Step 4 — Visually analyze representative frames
+## Step 4 — Identify characters with Claude Vision (character-counting pass)
 
-Use `view` on each character's `representative_frame` to identify who/what it is.
-Then sweep through the full manifest, grouping near-identical consecutive frames.
+Pick **5–8 well-distributed frames** from the manifest (or use the
+`representative_frame` paths from `clusters.json`). Inspect each with the
+`view` tool.
 
 ```
 view: /tmp/video_work/frames/frame_0001.jpg
@@ -95,23 +113,45 @@ view: /tmp/video_work/frames/frame_0009.jpg
 …
 ```
 
-For each frame write a 2–4 sentence description: who is present, setting, action,
-any on-screen text. Keep a running list:
+For each frame, note every **distinct person or character** visible: appearance,
+clothing, setting. Then synthesize across all frames:
+
+- How many distinct characters appear in total?
+- Give each a short label and description (e.g. "Character 1 — Gioggia: blonde,
+  white suit, office setting").
+
+**This count and identification come from your visual judgment**, not from
+the clustering script. The skill targets AI-generated and stylized video where
+geometric face detectors are unreliable; a vision model reasoning about
+"distinct characters" is more appropriate.
+
+Record your findings:
 
 ```
-[00:00:00] <description>
-[00:00:05] <description>
+Character 1: <name/label> — <description>
+Character 2: <name/label> — <description>
 …
 ```
 
-Also assign a name/label to each character cluster (e.g. "Character 1 = Gioggia –
-bionda, completo bianco, ufficio"). This will be used in the JSON.
+---
+
+## Step 5 — Full visual timeline (optional, ~40k+ tokens)
+
+If the user wants a frame-by-frame timeline, sweep through all frames in the
+manifest. Group near-identical consecutive frames and write a 2–4 sentence
+description per distinct scene:
+
+```
+[00:00:00] <who is present, setting, action, any on-screen text>
+[00:00:05] <…>
+…
+```
+
+Skip this step for a summary-only report to keep token cost low.
 
 ---
 
-## Step 5 — Build the JSON report
-
-Collect the following inputs then run:
+## Step 6 — Build the JSON report
 
 ```bash
 python3 /home/claude/video-analyzer/scripts/build_json_report.py \
@@ -131,9 +171,12 @@ Example values:
 --key-observations '["Prodotto con SHOWRUNNER.XYZ","4 personaggi distinti"]'
 ```
 
+`--character-names` is the output of your Claude Vision identification pass
+(Step 4). If you skipped Step 4 (summary-only), pass `{}`.
+
 ---
 
-## Step 6 — Build the Markdown report
+## Step 7 — Build the Markdown report
 
 Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
 
@@ -153,12 +196,12 @@ Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
 | FPS | `N` |
 | Bitrate | `N kbps` |
 
-## 2. Personaggi Rilevati
-*(N personaggi distinti rilevati automaticamente)*
+## 2. Personaggi Identificati
+*(N personaggi distinti identificati da Claude Vision)*
 
-| ID | Nome/Label | Presenze | Prima apparizione | Ultima apparizione |
-|----|-----------|----------|-------------------|-------------------|
-| 1  | ...        | N frame  | HH:MM:SS          | HH:MM:SS          |
+| ID | Nome/Label | Descrizione |
+|----|-----------|-------------|
+| 1  | ...        | ...         |
 
 ## 3. Trascrizione Audio
 *(Timestamped — [HH:MM:SS] testo)*
@@ -179,7 +222,7 @@ Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
 
 ---
 
-## Step 7 — Present both files
+## Step 8 — Present both files
 
 ```python
 present_files([
@@ -192,9 +235,11 @@ present_files([
 
 ## Tips & edge cases
 
-- **No audio**: set transcript a "No audio track detected."
-- **Screen recordings**: presta attenzione a UI, testo sullo schermo, titoli finestre
-- **Video veloce**: `--fps 1.0`; **molto lungo (>30 min)**: `--fps 0.1 --max-frames 60`
-- **Audio straniero**: Whisper è multilingue, nessuna configurazione necessaria
-- **Troppi cluster (>8)**: aumenta `--similarity-threshold` a 0.80 nel detect_characters
-- **Troppo pochi cluster**: abbassa `--similarity-threshold` a 0.60
+- **No audio**: set transcript to "No audio track detected."
+- **Screen recordings**: pay attention to UI, on-screen text, window titles
+- **Fast-cut video**: `--fps 1.0`; **very long (>30 min)**: `--fps 0.1 --max-frames 60`
+- **Foreign audio**: Whisper is multilingual, no configuration needed
+- **AI-generated / animated video**: face detectors won't work; rely entirely on
+  Claude Vision for character identification — this is the expected use case
+- **Skip clustering entirely**: just pick frames evenly spaced from the manifest
+  for the character-counting pass

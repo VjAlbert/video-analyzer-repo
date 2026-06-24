@@ -41,6 +41,15 @@ os.makedirs(FRAMES_DIR, exist_ok=True)
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
+def _parse_rate(rate_str):
+    """Parse an ffprobe rate string like '30/1' or '30000/1001' safely."""
+    try:
+        num, den = rate_str.split("/")
+        den = float(den)
+        return float(num) / den if den else 0.0
+    except (ValueError, AttributeError):
+        return 0.0
+
 # ── 1. Metadata ───────────────────────────────────────────────────────────────
 print("[1/4] Extracting metadata …", flush=True)
 meta = run([
@@ -72,7 +81,7 @@ summary_meta = {
     "video_codec": video_stream.get("codec_name", "unknown"),
     "width": video_stream.get("width"),
     "height": video_stream.get("height"),
-    "fps_original": eval(video_stream.get("r_frame_rate", "0/1")),
+    "fps_original": _parse_rate(video_stream.get("r_frame_rate", "0/1")),
     "audio_codec": audio_stream.get("codec_name", "none"),
     "audio_sample_rate": audio_stream.get("sample_rate"),
     "bitrate_kbps": round(int(fmt.get("bit_rate", 0)) / 1000, 1),
@@ -86,7 +95,7 @@ print(f"[2/4] Extracting frames at {fps:.3f} fps (max {max_frames}) …", flush=
 frame_pattern = os.path.join(FRAMES_DIR, "frame_%04d.jpg")
 run([
     "ffmpeg", "-y", "-i", VIDEO,
-    "-vf", f"fps={fps},scale='min(1280,iw):-2'",
+    "-vf", f"fps={fps},scale='min(1568,iw)':'min(1568,ih)':force_original_aspect_ratio=decrease",
     "-q:v", "3",
     "-frames:v", str(max_frames),
     frame_pattern
