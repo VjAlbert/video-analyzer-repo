@@ -18,7 +18,11 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
+
+# Ensure stdout/stderr can render non-ASCII output on Windows (cp1252).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ── Args ─────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -29,8 +33,8 @@ parser.add_argument("--max-frames", type=int, default=30,
                     help="Hard cap on frames extracted (default 30)")
 parser.add_argument("--output-dir", default="/tmp/video_work",
                     help="Working directory for extracted assets")
-parser.add_argument("--model", default="base",
-                    help="Whisper model: tiny/base/small/medium (default base)")
+parser.add_argument("--model", default="turbo",
+                    help="Whisper model: tiny / base / small / medium / large / turbo / large-v3-turbo (default turbo)")
 args = parser.parse_args()
 
 VIDEO = args.video
@@ -131,10 +135,15 @@ has_audio = audio_res.returncode == 0 and os.path.exists(AUDIO_PATH) and os.path
 # ── 4. Transcription ──────────────────────────────────────────────────────────
 TRANSCRIPT_PATH = os.path.join(OUTDIR, "transcript.txt")
 if has_audio:
-    print(f"[4/4] Transcribing audio with Whisper ({args.model}) …", flush=True)
+    # Handle aliases for the newly added model
+    model_name = args.model.lower().strip()
+    if model_name == "large-v3-turbo":
+        model_name = "turbo"
+
+    print(f"[4/4] Transcribing audio with Whisper ({model_name}) …", flush=True)
     try:
         import whisper
-        model = whisper.load_model(args.model)
+        model = whisper.load_model(model_name)
         result = model.transcribe(AUDIO_PATH, fp16=False, verbose=False)
         transcript = result.get("text", "").strip()
         # Also save timestamped segments

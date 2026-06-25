@@ -41,8 +41,12 @@ def read_json(path):
 
 def read_text(path):
     if os.path.exists(path):
-        with open(path) as f:
-            return f.read().strip()
+        for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                with open(path, encoding=enc) as f:
+                    return f.read().strip()
+            except UnicodeDecodeError:
+                continue
     return ""
 
 metadata    = read_json(os.path.join(args.work_dir, "metadata.json"))
@@ -92,10 +96,6 @@ report = {
     "visual_timeline": visual_timeline,
     "summary": args.summary,
     "key_observations": key_observations,
-    "frames": {
-        "total_extracted": len(manifest) if isinstance(manifest, list) else 0,
-        "manifest": manifest if isinstance(manifest, list) else [],
-    }
 }
 
 with open(args.output, "w", encoding="utf-8") as f:

@@ -25,6 +25,11 @@ import json
 import os
 import sys
 
+# Ensure stdout/stderr can render non-ASCII output on Windows (cp1252).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import cv2
 import numpy as np
 
