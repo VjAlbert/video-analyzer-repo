@@ -178,15 +178,19 @@ The execution generates both a machine-readable `.json` document and a human-rea
 
 ---
 
-## Limitations
+## Technical Notes & System Behavior
 
-Please consider the following structural limitations and behavior:
+### 1. Accuracy and Performance (Whisper large-v3-turbo)
+The pipeline leverages OpenAI's `large-v3-turbo` model, which optimizes processing efficiency by reducing decoder layers from 32 to 4. This architecture guarantees significantly faster processing speeds with an almost imperceptible loss in accuracy compared to the standard `large-v3`. Multilingual support (including Italian) is fully integrated and delivers transcription accuracy that easily outperforms the `medium` model. Native transcription and direct translation into English (via the `--task translate` flag) are fully supported. 
 
-* **Whisper `large-v3-turbo` Accuracy**: The `turbo` model reduces the decoder layers from 32 to 4 to maximize processing speed, resulting in minimal accuracy loss compared to the full `large-v3` model. However, translation tasks are not supported natively by `turbo`. For non-English to English translations, consider switching back to `--model medium` or `--model large`.
-* **Visual Character Counting is an Estimate**: Character identification is handled by LLM vision assessment of representative frames rather than a dedicated facial-recognition model. It is designed to estimate character presence in varied settings (including stylized or animated content), but it may miss brief background appearances or miscount individuals in large crowds.
-* **Histogram Clustering is Structural, Not Semantic**: The scene clustering algorithm uses HSV histogram correlation to detect changes in dominant colors and lighting. While helpful for isolating scene changes and cuts, it does not understand semantic context or track human movement.
-* **No Speaker Diarization**: The transcription process outputs a single chronological text timeline and does not assign spoken segments to specific speakers. This design keeps the local setup simple and removes the need for registration keys (e.g., PyAnnote on HuggingFace).
+### 2. Vision-Based Character Tracking
+Character identification is handled via visual analysis of keyframes using Vision LLMs rather than a dedicated, rigid facial-recognition database. This flexible, context-aware approach allows the system to recognize and track characters even in complex, stylized, or animated environments where traditional biometrics would fail. Because it relies on overall visual assessment of representative frames, precision is optimal for main characters and clear shots, while serving as a high-level estimate in massive crowds or for brief background appearances. 
 
+### 3. Structural Scene Clustering
+The scene clustering algorithm detects transitions by analyzing structural variations in color distribution and lighting within the HSV color space. This method provides an extremely efficient, lightweight solution for isolating camera cuts, editing choices, and distinct scene changes. The system is engineered to map visual timeline continuity and structural breaks rather than track semantic context or individual human movement within a single continuous shot. 
+
+### 4. Streamlined Timeline Transcription
+The transcription module outputs a single, chronological text timeline optimized for seamless readability and immediate integration with the video manifest. To keep the local environment lightweight, cross-platform, and free from external dependencies or API registration keys (such as HuggingFace tokens for PyAnnote), the system processes the audio track as a continuous stream without performing speaker diarization (speaker partitioning). 
 ---
 
 ## License

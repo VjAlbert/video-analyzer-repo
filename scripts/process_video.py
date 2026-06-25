@@ -33,8 +33,10 @@ parser.add_argument("--max-frames", type=int, default=30,
                     help="Hard cap on frames extracted (default 30)")
 parser.add_argument("--output-dir", default="/tmp/video_work",
                     help="Working directory for extracted assets")
-parser.add_argument("--model", default="turbo",
-                    help="Whisper model: tiny / base / small / medium / large / turbo / large-v3-turbo (default turbo)")
+parser.add_argument("--model", default="large-v3-turbo",
+                    help="Whisper model: tiny / base / small / medium / large / large-v3-turbo (default large-v3-turbo)")
+parser.add_argument("--task", default="transcribe", choices=["transcribe", "translate"],
+                    help="Task to perform: transcribe or translate to English (default transcribe)")
 args = parser.parse_args()
 
 VIDEO = args.video
@@ -132,21 +134,22 @@ audio_res = run([
 ])
 has_audio = audio_res.returncode == 0 and os.path.exists(AUDIO_PATH) and os.path.getsize(AUDIO_PATH) > 1000
 
-# ── 4. Transcription ──────────────────────────────────────────────────────────
+# ── 4. Transcription / Translation ──────────────────────────────────────────
 TRANSCRIPT_PATH = os.path.join(OUTDIR, "transcript.txt")
 if has_audio:
-    # Handle aliases for the newly added model
     model_name = args.model.lower().strip()
-    if model_name == "large-v3-turbo":
-        model_name = "turbo"
+    # Normalizzazione alias per garantire compatibilità con le diverse versioni delle librerie
+    if model_name == "turbo":
+        model_name = "large-v3-turbo"
 
-    print(f"[4/4] Transcribing audio with Whisper ({model_name}) …", flush=True)
+    print(f"[4/4] Processing audio with Whisper ({model_name}) | Task: {args.task} …", flush=True)
     try:
         import whisper
         model = whisper.load_model(model_name)
-        result = model.transcribe(AUDIO_PATH, fp16=False, verbose=False)
+        result = model.transcribe(AUDIO_PATH, task=args.task, fp16=False, verbose=False)
         transcript = result.get("text", "").strip()
-        # Also save timestamped segments
+        
+        # Generazione segmenti con timestamp
         segments = result.get("segments", [])
         lines = []
         for seg in segments:
@@ -154,9 +157,10 @@ if has_audio:
             h3, rem3 = divmod(t0, 3600)
             m3, s3 = divmod(rem3, 60)
             lines.append(f"[{h3:02d}:{m3:02d}:{s3:02d}] {seg['text'].strip()}")
+            
         with open(TRANSCRIPT_PATH, "w") as f:
             f.write("\n".join(lines) if lines else transcript)
-        print(f"    Transcription done ({len(transcript)} chars)", flush=True)
+        print(f"    Processing done ({len(transcript)} chars)", flush=True)
     except Exception as e:
         print(f"    Whisper error: {e}", flush=True)
         with open(TRANSCRIPT_PATH, "w") as f:
