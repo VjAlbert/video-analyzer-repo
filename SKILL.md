@@ -17,10 +17,46 @@ compatibility: >
 
 # Video Analyzer Skill
 
-Converts a video file into a complete, structured report (Markdown **and** JSON) that
+Converts a video file into a complete, structured report (Markdown, JSON **and** PDF) that
 captures everything an AI or human needs to understand the video without watching it.
 Includes audio transcription (Whisper), visual frame analysis (Claude Vision), and
 optional scene clustering to aid frame selection.
+
+---
+
+## Installation
+
+### Claude Code / Cowork (full execution)
+
+```bash
+pip install openai-whisper opencv-python-headless numpy Pillow \
+    --break-system-packages -q 2>/dev/null || true
+
+# PDF renderer — install one (weasyprint preferred, reportlab as fallback):
+pip install weasyprint      # requires GTK3 on Linux/macOS
+pip install reportlab       # pure Python, works everywhere
+```
+
+Running `build_json_report.py` automatically generates **MD + JSON + PDF** in a single
+invocation. No separate command is needed for the PDF.
+
+### Claude.ai Desktop / Web (read-only mode)
+
+Upload `SKILL.md` as an instruction file in a Claude Project. The skill will describe
+the analysis process and interpret pre-generated JSON/MD reports, but **cannot execute**
+`ffmpeg`, Whisper, or the Python scripts without Claude Code or Cowork.
+For full execution (frame extraction, transcription, PDF generation) use Claude Code.
+
+### Customising the PDF template
+
+The CSS and HTML layout live entirely inside `scripts/build_pdf_report.py` — no
+external stylesheets or assets. To customise colours, fonts, or sections:
+1. Edit the `_CSS` string constant near the top of the file.
+2. Edit the `_build_html()` function for structural changes (sections, order).
+3. Edit `_build_pdf_reportlab()` for the reportlab fallback layout.
+
+The `generate_pdf(json_path, frames_dir, output_dir)` function is the stable public
+API — call it from any script without touching the internals.
 
 **Token cost estimates** (choose your mode):
 - **Character-counting pass only** (5–8 frames): ~8–12k vision tokens
@@ -49,7 +85,7 @@ python3 /home/claude/video-analyzer/scripts/process_video.py \
     --fps 0.5 \
     --max-frames 30 \
     --output-dir /tmp/video_work \
-    --model base
+    --model large-v3-turbo
 ```
 
 Frames are resized so the long edge is at most **1568 px** (aspect ratio preserved).
@@ -61,7 +97,7 @@ This keeps vision token cost predictable at roughly ~1,400 tokens/frame.
 |-----------|---------|----------------|
 | `--fps` | 0.5 | Increase for fast-cut videos (try 1.0); decrease for slow/static (try 0.2) |
 | `--max-frames` | 30 | Increase for long videos (up to 60) |
-| `--model` | base | Use `small` or `medium` for better transcription accuracy |
+| `--model` | large-v3-turbo | Whisper model: tiny/base/small/medium/large-v3-turbo |
 
 ---
 
@@ -195,6 +231,8 @@ Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
 | Dimensione | `N MB` |
 | FPS | `N` |
 | Bitrate | `N kbps` |
+| Whisper model | `<metadata.whisper_model>` |
+| Vision model | `<metadata.vision_model>` |
 
 ## 2. Personaggi Identificati
 *(N personaggi distinti identificati da Claude Vision)*
@@ -204,7 +242,7 @@ Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
 | 1  | ...        | ...         |
 
 ## 3. Trascrizione Audio
-*(Timestamped — [HH:MM:SS] testo)*
+*(Timestamped — trascrizione automatica Whisper `<metadata.whisper_model>`, lingua: `<audio.language_detected>`)*
 ```
 <trascrizione>
 ```
@@ -243,3 +281,24 @@ present_files([
   Claude Vision for character identification — this is the expected use case
 - **Skip clustering entirely**: just pick frames evenly spaced from the manifest
   for the character-counting pass
+
+---
+
+## Scripts
+
+| Script | Role |
+|--------|------|
+| `process_video.py` | Pre-processing: metadata → scene detection → audio → Whisper → `intermediate_nodes.json` |
+| `cluster_frames.py` | Optional: groups scene frames by HSV similarity for representative frame selection |
+| `build_json_report.py` | Semantic compression + global_index + JSON report; auto-calls `build_pdf_report.py` |
+| `build_pdf_report.py` | PDF generator (weasyprint → reportlab fallback). Entry point: `generate_pdf(json, frames_dir, out_dir)` |
+
+### Intermediate files
+
+| File | Description |
+|------|-------------|
+| `metadata.json` | ffprobe metadata (duration, codec, resolution, …) |
+| `manifest.json` | Frame paths and scene-change timestamps |
+| `transcript.txt` | Whisper transcript with `[HH:MM:SS]` markers |
+| `clusters.json` | Visual clusters from `cluster_frames.py` (optional) |
+| `intermediate_nodes.json` | Formato pivot interno da cui vengono generati tutti gli output. Non eliminare tra le esecuzioni. |

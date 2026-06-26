@@ -1,29 +1,44 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.Python
-*.egg-info/
-dist/
-build/
-.venv/
-
-# Working files (never commit extracted frames or audio)
-/tmp/
-*.wav
-*.mp3
+# Video sorgente
 *.mp4
 *.mov
 *.avi
 *.mkv
+*.webm
+
+# Output generati a runtime
+*_report.pdf
+*_report.md
+*_report.json
+intermediate_nodes.json
+metadata.json
+
+# Frame estratti
 frames/
-video_work/
+frames_*/
+
+# Whisper cache e modelli
+.cache/
+*.pt
+whisper_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Editor
-.vscode/
-.idea/
-*.swp
+# Temp
+tmp_*/
+work_*/
+*.tmp
+*.log
