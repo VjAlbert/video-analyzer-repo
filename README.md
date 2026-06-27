@@ -43,42 +43,42 @@ ln -sfn ~/video-analyzer ~/.claude/skills/video-analyzer   # Claude Code
 
 Produces all three outputs: `.md` + `.json` + `.pdf`.
 
-> ⚠️ **Nota su large-v3-turbo**: il modello Whisper viene scaricato automaticamente al primo run (~1.6 GB). Assicurati di avere connessione e spazio disco disponibile prima del primo utilizzo.
+> ⚠️ **Note on large-v3-turbo**: the Whisper model is automatically downloaded on the first run (~1.6 GB). Make sure you have connection and disk space available before first use.
 
 ### Cowork Desktop
 
-1. Apri Cowork → Settings → Skills → Upload
-2. Trascina la cartella `video-analyzer/` completa (non solo `SKILL.md`)
-3. La skill sarà disponibile nella sessione corrente
+1. OPEN Cowork → Settings → Skills → Upload
+2. Drag the folder `video-analyzer/` completa (non solo `SKILL.md`)
+3. The skill will be available in the current session
 
 ### Claude.ai Desktop / Web (read-only mode)
 
-Claude.ai non supporta l'esecuzione di script Python o ffmpeg. Puoi caricare `SKILL.md` come istruzione personalizzata in un Claude Project per documentazione e reference, ma l'esecuzione completa richiede Claude Code o Cowork.
+Claude.ai does not support running Python or ffmpeg scripts. You can load `SKILL.md` as a custom instruction into a Claude Project for documentation and reference, but full execution requires Claude Code or Cowork.
 
 ---
 
 ## Requirements
 
 ```
-Auto-installati al primo run:
-- ffmpeg                   (deve essere sul PATH di sistema — verifica con: ffmpeg -version)
-- openai-whisper           (modello default: large-v3-turbo, ~1.6 GB al primo download)
+Auto-installed on first run:
+- ffmpeg                   (must be in your system PATH — check with: ffmpeg -version)
+- openai-whisper           (default model: large-v3-turbo, ~1.6 GB on first download)
 - opencv-python-headless
 - numpy, Pillow
-- reportlab                (PDF renderer — fallback se weasyprint non disponibile)
+- reportlab                (PDF renderer — fallback if weasyprint is not available)
 ```
 
 ```bash
 pip install openai-whisper opencv-python-headless numpy Pillow reportlab
 ```
 
-> **Windows**: `weasyprint` richiede GTK e non è nativo su Windows. Il fallback `reportlab` viene usato automaticamente.
+> **Windows**: `weasyprint` requires GTK and is not native on Windows. The `reportlab` fallback is used automatically.
 
 ---
 
 ## Architecture v2.0
 
-Pipeline a tre stadi con formato pivot intermedio:
+Three-stage pipeline with intermediate pivot format:
 
 ```
                   ┌─────────────────────────────┐
