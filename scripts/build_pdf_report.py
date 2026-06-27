@@ -19,9 +19,16 @@ import base64
 import html
 import json
 import os
+import re
 import sys
 from datetime import date
 from xml.sax.saxutils import escape as _xe
+
+# Single authoritative version string — defined in scripts/version.py
+_here = os.path.dirname(os.path.abspath(__file__))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
+from version import __version__ as _SKILL_VERSION
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -102,13 +109,34 @@ table.thumbs img {
 }
 .tl-body { flex: 1; }
 .tl-text { font-size: 9pt; margin-bottom: 3pt; }
-.badges  { margin-top: 3pt; }
-.badge {
-    display: inline-block; background: #e94560; color: #fff;
-    border-radius: 3pt; padding: 1pt 5pt; font-size: 7pt; margin: 1pt 2pt 1pt 0;
-}
 ul.obs { padding-left: 16pt; font-size: 9.5pt; }
 ul.obs li { margin-bottom: 3pt; }
+.tx-summary {
+    margin-bottom: 8pt; padding: 5pt 10pt;
+    background: #fff8e1; border-left: 3px solid #e94560;
+    font-size: 9pt; font-weight: 600;
+}
+.tx-row { padding: 4pt 0; border-bottom: 1px solid #f0f0f0; display: flex; gap: 10pt; }
+.tx-ts  { font-family: monospace; font-size: 8.5pt; color: #e94560; font-weight: 700; white-space: nowrap; min-width: 68pt; padding-top: 1pt; }
+.tx-text { flex: 1; font-size: 9pt; }
+.tx-low  { color: #888888; font-style: italic; }
+.tx-badge { display: inline-block; border: 1px solid #cccccc; border-radius: 2pt; padding: 0 4pt; font-size: 7pt; color: #888888; font-style: normal; margin-right: 4pt; vertical-align: middle; }
+.src-audio {
+    display: inline; background: #1a6e4f; color: #fff;
+    padding: 1pt 5pt; border-radius: 2pt; font-size: 7pt; font-weight: 700;
+    font-style: normal; margin-right: 5pt; vertical-align: middle;
+}
+.src-vision {
+    display: inline; background: #5a3e9a; color: #fff;
+    padding: 1pt 5pt; border-radius: 2pt; font-size: 7pt; font-weight: 700;
+    font-style: normal; margin-right: 5pt; vertical-align: middle;
+}
+.vision-line { font-style: italic; color: #5a3e9a; font-size: 9pt; margin-bottom: 2pt; }
+.thumb-desc-vision { font-size: 7.5pt; color: #5a3e9a; font-style: italic; margin-top: 2pt; line-height: 1.3; }
+.disclaimer {
+    background: #f5f5f5; border-left: 3pt solid #888888;
+    padding: 7pt 10pt; font-size: 8.5pt; margin-bottom: 16pt; line-height: 1.5;
+}
 footer {
     text-align: center; font-size: 8pt; color: #aaa;
     margin-top: 22pt; padding-top: 8pt; border-top: 1px solid #eee;
@@ -117,11 +145,14 @@ footer {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _ts_to_secs(ts_str):
-    """Parse HH:MM:SS.mmm → float seconds."""
+    """Parse HH:MM:SS or HH:MM:SS.mmm → float seconds."""
     try:
-        parts = ts_str.replace(".", ":").split(":")
-        h, mn, s, ms = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-        return h * 3600 + mn * 60 + s + ms / 1000.0
+        parts = re.split(r"[:\.]", ts_str)
+        h_  = int(parts[0])
+        mn_ = int(parts[1])
+        s_  = int(parts[2])
+        ms_ = int(parts[3]) if len(parts) > 3 else 0
+        return h_ * 3600 + mn_ * 60 + s_ + ms_ / 1000.0
     except (ValueError, IndexError):
         return 0.0
 
@@ -195,6 +226,18 @@ def _build_html(report, nodes, thumbnails, today_str):
     filename = meta.get("filename", "Video")
     duration = meta.get("duration_formatted", "–")
 
+    audio_info      = report.get("audio", {})
+    transcript_segs = audio_info.get("transcript_segments", [])
+    n_total      = len(transcript_segs)
+    n_low        = sum(1 for s in transcript_segs if s.get("low_confidence") is True)
+    lang_note_raw = (audio_info.get("language_note") or
+                     audio_info.get("language_detected", "–"))
+    lang_note     = h(lang_note_raw)
+    conf_summary = (
+        f"Trascrizione: {n_total} segmenti totali, "
+        f"{n_low} a bassa confidenza (da verificare manualmente)"
+    )
+
     parts = [
         "<!DOCTYPE html>",
         "<html lang='it'><head><meta charset='utf-8'>",
@@ -208,8 +251,19 @@ def _build_html(report, nodes, thumbnails, today_str):
         f"<header>"
         f"<h1>{h(filename)}</h1>"
         f"<div class='sub'>Durata: {h(duration)} &nbsp;|&nbsp; "
-        f"Analizzato: {today_str} &nbsp;|&nbsp; video-analyzer skill v1.1</div>"
+        f"Analizzato: {today_str} &nbsp;|&nbsp; video-analyzer skill v{_SKILL_VERSION}</div>"
+        f"<div class='sub'>{h(conf_summary)}</div>"
         f"</header>"
+    )
+    parts.append(
+        "<div class='disclaimer'>"
+        "<b>Nota sulle sorgenti:</b> "
+        "I testi con <span class='src-audio'>🎤 audio</span> sono trascrizioni Whisper "
+        "verificabili riascoltando il video originale. "
+        "Le descrizioni con <span class='src-vision'>👁 visione</span> sono generate da "
+        "Claude Vision analizzando singoli fotogrammi: inferenza automatica, "
+        "può contenere errori di interpretazione."
+        "</div>"
     )
 
     # ── Section 1 — Metadata ──────────────────────────────────────────────────
@@ -228,7 +282,7 @@ def _build_html(report, nodes, thumbnails, today_str):
         ("Codec audio",            h(str(meta.get("audio_codec",  "–")))),
         ("Bitrate",                f"{meta.get('bitrate_kbps', '–')} kbps"),
         ("Dimensione",             f"{meta.get('size_mb', '–')} MB"),
-        ("Lingua rilevata",        h(str(meta.get("language_detected", "–")))),
+        ("Lingua",                  lang_note),
         ("Personaggi identificati",str(n_chars)),
         ("Scene con delta visivo", str(n_scenes)),
     ]
@@ -268,12 +322,16 @@ def _build_html(report, nodes, thumbnails, today_str):
                     img_tag = f'<img src="{src}" alt="frame {h(thumb["ts"])}">'
                 except Exception:
                     img_tag = ""
-                ts_s   = h(thumb["ts"])
-                desc_s = h(thumb["desc"])
+                ts_s     = h(thumb["ts"])
+                raw_desc = thumb["desc"]
+                desc_s   = (
+                    f"<span class='src-vision'>👁 visione</span> {h(raw_desc)}"
+                    if raw_desc else ""
+                )
                 parts.append(
                     f"<td>{img_tag}"
                     f"<div class='thumb-ts'>[{ts_s}]</div>"
-                    f"<div class='thumb-desc'>{desc_s}</div></td>"
+                    f"<div class='thumb-desc-vision'>{desc_s}</div></td>"
                 )
             for _ in range(3 - len(row)):
                 parts.append("<td></td>")
@@ -286,26 +344,78 @@ def _build_html(report, nodes, thumbnails, today_str):
     # ── Section 4 — Timeline ──────────────────────────────────────────────────
     parts.append("<div class='section'><h2>4. Timeline</h2>")
     for node in nodes:
-        ts_val   = h((node.get("anchor_ts") or "")[:8])
-        text_val = h(node.get("text_clean") or node.get("text_raw") or "")
-        badges   = "".join(
-            f"<span class='badge'>{h(k)}</span>"
-            for k in (node.get("keywords") or [])
+        raw_ats    = (node.get("anchor_ts") or "")[:8]
+        ts_val     = h(raw_ats) if raw_ats else "[timestamp non disponibile]"
+        text_val   = h(node.get("text_clean") or node.get("text_raw") or "")
+        visual_val = node.get("visual_delta") or ""
+        show_vis   = bool(visual_val) and visual_val not in ("analisi frame", "vision_error")
+        raw_vts    = (node.get("visual_delta_ts") or raw_ats)
+        vis_ts     = h(raw_vts) if raw_vts else "[timestamp non disponibile]"
+        audio_html = (
+            f"<p class='tl-text'>"
+            f"<span class='src-audio'>🎤 audio</span>{text_val}</p>"
+            if text_val else ""
+        )
+        vision_html = (
+            f"<p class='vision-line'>"
+            f"<span class='tl-ts' style='min-width:auto;padding-right:6pt'>[{vis_ts}]</span>"
+            f"<span class='src-vision'>👁 visione</span>{h(visual_val)}</p>"
+            if show_vis else ""
         )
         parts.append(
             f"<div class='tl-node'>"
             f"<span class='tl-ts'>[{ts_val}]</span>"
             f"<div class='tl-body'>"
-            f"<p class='tl-text'>{text_val}</p>"
-            f"<div class='badges'>{badges}</div>"
+            f"{audio_html}"
+            f"{vision_html}"
             f"</div></div>"
         )
     if not nodes:
         parts.append("<p style='color:#888'>Nessun nodo disponibile.</p>")
     parts.append("</div>")
 
-    # ── Section 5 — Key observations ──────────────────────────────────────────
-    parts.append("<div class='section'><h2>5. Osservazioni Chiave</h2>")
+    # ── Section 5 — Trascrizione ──────────────────────────────────────────────
+    parts.append(
+        "<div class='section'>"
+        "<h2>5. Trascrizione <span class='src-audio'>🎤 audio</span></h2>"
+    )
+    full_summary = f"{conf_summary} · Lingua: {lang_note_raw}"
+    parts.append(f"<div class='tx-summary'>{h(full_summary)}</div>")
+    if transcript_segs:
+        for seg in transcript_segs:
+            raw_ts = seg.get("timestamp", "")
+            ts_s   = h(raw_ts) if raw_ts else "[timestamp non disponibile]"
+            text_s = h(seg.get("text", ""))
+            lc     = seg.get("low_confidence")  # True, False, or None
+            if lc is True:
+                parts.append(
+                    f"<div class='tx-row'>"
+                    f"<span class='tx-ts'>[{ts_s}]</span>"
+                    f"<span class='tx-text tx-low'>"
+                    f"<span class='tx-badge'>⚠️ incerto</span>{text_s}</span>"
+                    f"</div>"
+                )
+            elif lc is None:
+                parts.append(
+                    f"<div class='tx-row'>"
+                    f"<span class='tx-ts'>[{ts_s}]</span>"
+                    f"<span class='tx-text'>{text_s}"
+                    f" <span class='tx-badge'>conf. n/d</span></span>"
+                    f"</div>"
+                )
+            else:
+                parts.append(
+                    f"<div class='tx-row'>"
+                    f"<span class='tx-ts'>[{ts_s}]</span>"
+                    f"<span class='tx-text'>{text_s}</span>"
+                    f"</div>"
+                )
+    else:
+        parts.append("<p style='color:#888'>Nessun segmento trascrizione disponibile.</p>")
+    parts.append("</div>")
+
+    # ── Section 6 — Key observations ──────────────────────────────────────────
+    parts.append("<div class='section'><h2>6. Osservazioni Chiave</h2>")
     if obs:
         parts.append("<ul class='obs'>")
         for item in obs:
@@ -316,7 +426,7 @@ def _build_html(report, nodes, thumbnails, today_str):
     parts.append("</div>")
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    parts.append(f"<footer>Generated by video-analyzer skill v1.1 — {today_str}</footer>")
+    parts.append(f"<footer>Generated by video-analyzer skill v{_SKILL_VERSION} — {today_str}</footer>")
     parts.append("</body></html>")
 
     return "\n".join(parts)
@@ -330,6 +440,17 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
     filename = meta.get("filename", "Video")
     duration = meta.get("duration_formatted", "–")
 
+    audio_info      = report.get("audio", {})
+    transcript_segs = audio_info.get("transcript_segments", [])
+    n_total      = len(transcript_segs)
+    n_low        = sum(1 for s in transcript_segs if s.get("low_confidence") is True)
+    lang_note_rl = (audio_info.get("language_note") or
+                    audio_info.get("language_detected", "–"))
+    conf_summary = (
+        f"Trascrizione: {n_total} segmenti totali, "
+        f"{n_low} a bassa confidenza (da verificare manualmente)"
+    )
+
     doc = _RL_DOC(
         output_path, pagesize=_RL_A4,
         leftMargin=20*_RL_MM, rightMargin=20*_RL_MM,
@@ -337,19 +458,31 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
     )
 
     styles = _RL_STYLES()
-    ACCENT = _RL_COLORS.HexColor("#e94560")
-    DARK   = _RL_COLORS.HexColor("#1a1a2e")
+    ACCENT      = _RL_COLORS.HexColor("#e94560")
+    DARK        = _RL_COLORS.HexColor("#1a1a2e")
+    GREY        = _RL_COLORS.HexColor("#888888")
+    AUDIO_C     = _RL_COLORS.HexColor("#1a6e4f")
+    VISION_C    = _RL_COLORS.HexColor("#5a3e9a")
 
     H1 = _RL_PS("va_h1", parent=styles["Normal"],
                  fontSize=16, fontName="Helvetica-Bold",
                  textColor=DARK, spaceAfter=4)
     H2 = _RL_PS("va_h2", parent=styles["Normal"],
                  fontSize=12, fontName="Helvetica-Bold",
-                 textColor=DARK, spaceBefore=10, spaceAfter=4)
-    BODY  = styles["Normal"]
-    SMALL = _RL_PS("va_small", parent=BODY, fontSize=8)
-    MONO  = _RL_PS("va_mono",  parent=BODY, fontName="Courier",
-                   fontSize=8, textColor=ACCENT)
+                 textColor=DARK, spaceBefore=16, spaceAfter=2)
+    BODY        = styles["Normal"]
+    SMALL       = _RL_PS("va_small",      parent=BODY,  fontSize=8)
+    CONF_SUM    = _RL_PS("va_conf_sum",   parent=SMALL, fontSize=8,
+                          textColor=DARK, fontName="Helvetica-Bold",
+                          leftIndent=6,   borderPad=4, spaceBefore=2, spaceAfter=6)
+    LOW_CONF    = _RL_PS("va_low_conf",   parent=BODY,  fontSize=9,
+                          fontName="Helvetica-Oblique", textColor=GREY)
+    UNKCONF     = _RL_PS("va_unkconf",    parent=BODY,  fontSize=9, textColor=GREY)
+    VISION_BODY = _RL_PS("va_vision",     parent=BODY,  fontSize=8,
+                          fontName="Helvetica-Oblique", textColor=VISION_C)
+    DISCLAIMER  = _RL_PS("va_disclaimer", parent=BODY,  fontSize=8,
+                          leftIndent=8,   rightIndent=8, spaceBefore=4, spaceAfter=10,
+                          leading=12)
 
     page_w = doc.width
     story  = []
@@ -357,14 +490,24 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
     # Title
     story.append(_RL_P(filename, H1))
     story.append(_RL_P(
-        f"Durata: {duration} | Analizzato: {today_str} | video-analyzer skill v1.1",
+        f"Durata: {duration} | Analizzato: {today_str} | video-analyzer skill v{_SKILL_VERSION}",
         SMALL,
+    ))
+    story.append(_RL_P(conf_summary, CONF_SUM))
+    story.append(_RL_P(
+        '<b>Nota sulle sorgenti:</b> '
+        f'<font color="#1a6e4f"><b>[🎤 audio]</b></font> = trascrizione Whisper, '
+        'verificabile riascoltando il video originale. '
+        f'<font color="#5a3e9a"><b>[👁 visione]</b></font> = Claude Vision su singoli '
+        'fotogrammi: inferenza automatica, può contenere errori.',
+        DISCLAIMER,
     ))
     story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
     story.append(_RL_SP(0, 6))
 
     # ── Section 1 — Metadata ──────────────────────────────────────────────────
     story.append(_RL_P("1. Metadata", H2))
+    story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
     w  = meta.get("width")  or "–"
     ht = meta.get("height") or "–"
     n_scenes = len([n for n in nodes if n.get("visual_delta") is not None])
@@ -377,6 +520,7 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
         ["Codec video",           str(meta.get("video_codec",  "–"))],
         ["Codec audio",           str(meta.get("audio_codec",  "–"))],
         ["Dimensione",            f"{meta.get('size_mb', '–')} MB"],
+        ["Lingua",                lang_note_rl],
         ["Personaggi",            str(report.get("characters", {}).get("count", 0))],
         ["Scene con delta visivo",str(n_scenes)],
     ]
@@ -393,10 +537,11 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
         ("LEFTPADDING",  (0, 0), (-1,-1), 6),
     ]))
     story.append(meta_tbl)
-    story.append(_RL_SP(0, 10))
+    story.append(_RL_SP(0, 14))
 
     # ── Section 2 — Characters ────────────────────────────────────────────────
     story.append(_RL_P("2. Personaggi", H2))
+    story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
     char_data = [["ID", "Nome", "Prima app.", "Apparizioni"]]
     for c in chars:
         char_data.append([
@@ -420,10 +565,11 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
         ("LEFTPADDING",  (0, 0), (-1,-1), 6),
     ]))
     story.append(char_tbl)
-    story.append(_RL_SP(0, 10))
+    story.append(_RL_SP(0, 14))
 
     # ── Section 3 — Thumbnail grid ────────────────────────────────────────────
     story.append(_RL_P("3. Scene rilevate", H2))
+    story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
     if thumbnails:
         THUMB_W = (page_w - 20) / 3
         THUMB_H = 75
@@ -443,7 +589,9 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
                     ts_row.append(_RL_P(
                         f'<font color="#e94560">[{_xe(t["ts"])}]</font>', SMALL))
                     desc_row.append(_RL_P(
-                        _xe(t["desc"][:60]) if t["desc"] else "—", SMALL))
+                        (f'<font color="#5a3e9a"><i>👁 {_xe(t["desc"][:70])}</i></font>'
+                         if t["desc"] else "—"),
+                        SMALL))
             grid_tbl = _RL_TABLE(
                 [img_row, ts_row, desc_row],
                 colWidths=[THUMB_W + 6] * 3,
@@ -458,28 +606,74 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
             story.append(_RL_SP(0, 6))
     else:
         story.append(_RL_P("Nessun thumbnail disponibile — cartella frames/ non trovata.", SMALL))
-    story.append(_RL_SP(0, 10))
+    story.append(_RL_SP(0, 14))
 
     # ── Section 4 — Timeline ──────────────────────────────────────────────────
     story.append(_RL_P("4. Timeline", H2))
+    story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
     for node in nodes:
-        ts_s   = _xe((node.get("anchor_ts") or "")[:8])
-        text_s = _xe(node.get("text_clean") or node.get("text_raw") or "")
-        kws    = node.get("keywords") or []
-        kw_str = "  ".join(f"[{_xe(k)}]" for k in kws)
-        story.append(_RL_P(
-            f'<font color="#e94560"><b>[{ts_s}]</b></font>  {text_s}',
-            BODY,
-        ))
-        if kw_str:
-            story.append(_RL_P(kw_str, SMALL))
-        story.append(_RL_SP(0, 3))
+        raw_ats   = (node.get("anchor_ts") or "")[:8]
+        ts_s      = _xe(raw_ats) if raw_ats else "[timestamp non disponibile]"
+        text_s    = _xe(node.get("text_clean") or node.get("text_raw") or "")
+        visual_s  = node.get("visual_delta") or ""
+        show_vis  = bool(visual_s) and visual_s not in ("analisi frame", "vision_error")
+        raw_vts   = node.get("visual_delta_ts") or raw_ats
+        vis_ts    = _xe(raw_vts) if raw_vts else "[timestamp non disponibile]"
+        if text_s:
+            story.append(_RL_P(
+                f'<font color="#e94560"><b>[{ts_s}]</b></font>'
+                f'  <font color="#1a6e4f"><b>[🎤]</b></font>  {text_s}',
+                BODY,
+            ))
+        if show_vis:
+            story.append(_RL_P(
+                f'<font color="#e94560">[{vis_ts}]</font>'
+                f'  <font color="#5a3e9a"><i>[👁 visione]  {_xe(visual_s)}</i></font>',
+                VISION_BODY,
+            ))
+        story.append(_RL_SP(0, 5))
     if not nodes:
         story.append(_RL_P("Nessun nodo disponibile.", SMALL))
-    story.append(_RL_SP(0, 8))
+    story.append(_RL_SP(0, 14))
 
-    # ── Section 5 — Key observations ──────────────────────────────────────────
-    story.append(_RL_P("5. Osservazioni Chiave", H2))
+    # ── Section 5 — Trascrizione ──────────────────────────────────────────────
+    story.append(_RL_P(
+        '5. Trascrizione  <font color="#1a6e4f"><b>[🎤 audio]</b></font>', H2))
+    story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
+    story.append(_RL_P(f"{conf_summary} · Lingua: {_xe(lang_note_rl)}", CONF_SUM))
+    if transcript_segs:
+        for seg in transcript_segs:
+            raw_ts = seg.get("timestamp", "")
+            ts_s   = _xe(raw_ts) if raw_ts else "[timestamp non disponibile]"
+            text_s = _xe(seg.get("text", ""))
+            lc     = seg.get("low_confidence")  # True, False, or None
+            if lc is True:
+                story.append(_RL_P(
+                    f'<font color="#e94560"><b>[{ts_s}]</b></font>'
+                    f'  <font color="#e94560"><b>[⚠ incerto]</b></font>'
+                    f'  <font color="#888888"><i>{text_s}</i></font>',
+                    LOW_CONF,
+                ))
+            elif lc is None:
+                story.append(_RL_P(
+                    f'<font color="#e94560"><b>[{ts_s}]</b></font>'
+                    f'  {text_s}'
+                    f'  <font color="#888888">[conf. n/d]</font>',
+                    UNKCONF,
+                ))
+            else:
+                story.append(_RL_P(
+                    f'<font color="#e94560"><b>[{ts_s}]</b></font>  {text_s}',
+                    BODY,
+                ))
+            story.append(_RL_SP(0, 2))
+    else:
+        story.append(_RL_P("Nessun segmento trascrizione disponibile.", SMALL))
+    story.append(_RL_SP(0, 14))
+
+    # ── Section 6 — Key observations ──────────────────────────────────────────
+    story.append(_RL_P("6. Osservazioni Chiave", H2))
+    story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
     if obs:
         for item in obs:
             story.append(_RL_P(f"• {_xe(str(item))}", BODY))
@@ -492,7 +686,7 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
                            textColor=_RL_COLORS.HexColor("#aaaaaa"))
     story.append(_RL_HR(width="100%", color=_RL_COLORS.HexColor("#dddddd"),
                         thickness=0.5, spaceAfter=4))
-    story.append(_RL_P(f"Generated by video-analyzer skill v1.1 — {today_str}", footer_style))
+    story.append(_RL_P(f"Generated by video-analyzer skill v{_SKILL_VERSION} — {today_str}", footer_style))
 
     doc.build(story)
 

@@ -148,8 +148,12 @@ def extract_keywords(text, top_n=5):
 # ── Read all sources ──────────────────────────────────────────────────────────
 def read_json(path):
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            print(f"    WARNING: could not read {path}: {e}", file=sys.stderr)
+            return {}
     return {}
 
 def read_text(path):
@@ -174,17 +178,33 @@ visual_timeline_auto = _vt_auto_raw if isinstance(_vt_auto_raw, list) else []
 _raw_nodes = read_json(os.path.join(args.work_dir, "intermediate_nodes.json"))
 intermediate_nodes = _raw_nodes if isinstance(_raw_nodes, list) else []
 
-# Parse transcript into structured segments (kept for audio.transcript_segments)
-transcript_segments = []
-if transcript_raw and transcript_raw not in ("NO_AUDIO", "") \
+# Load enriched transcript_segments (with Whisper confidence scores) written by
+# process_video.py. Falls back to parsing transcript.txt when the JSON file is
+# absent (backward compatibility with runs predating confidence scoring).
+_raw_segs = read_json(os.path.join(args.work_dir, "transcript_segments.json"))
+transcript_segments = _raw_segs if isinstance(_raw_segs, list) else []
+
+if not transcript_segments and transcript_raw and transcript_raw not in ("NO_AUDIO", "") \
         and not transcript_raw.startswith("TRANSCRIPTION_ERROR"):
     for line in transcript_raw.splitlines():
         line = line.strip()
         if line.startswith("[") and "]" in line:
             bracket_end = line.index("]")
             ts = line[1:bracket_end]
-            text = line[bracket_end + 1:].strip()
-            transcript_segments.append({"timestamp": ts, "text": text})
+            # Strip ⚠️ low-confidence marker that process_video.py may have appended.
+            text = re.sub(r"\s*⚠️\s*$", "", line[bracket_end + 1:]).strip()
+            transcript_segments.append({
+                "timestamp": ts,
+                "text": text,
+                "avg_logprob": None,
+                "no_speech_prob": None,
+                "confidence": None,
+                "low_confidence": None,
+            })
+
+for seg in transcript_segments:
+    if "source" not in seg:
+        seg["source"] = "audio"
 
 visual_timeline  = json.loads(args.visual_timeline)  if args.visual_timeline  else []
 character_names  = json.loads(args.character_names)  if args.character_names  else {}
@@ -196,6 +216,10 @@ _cli_ts_set = {e.get("timestamp", "")[:8] for e in visual_timeline}
 for _entry in visual_timeline_auto:
     if _entry.get("timestamp", "")[:8] not in _cli_ts_set:
         visual_timeline.append(_entry)
+
+for _entry in visual_timeline:
+    if "source" not in _entry:
+        _entry["source"] = "vision"
 
 # Bridge visual_timeline → intermediate_nodes.visual_delta.
 # For each timeline entry find the temporally closest node and populate its
@@ -212,15 +236,24 @@ if visual_timeline and intermediate_nodes:
         )
         _dist = abs(_ts_to_secs(_closest.get("anchor_ts", "00:00:00.000")) - _vt_secs)
         if _dist <= 5.0 and _closest.get("visual_delta") in (None, "analisi frame", "vision_error"):
-            _closest["visual_delta"] = _desc
+            _closest["visual_delta"]    = _desc
+            _closest["visual_delta_ts"] = _vt.get("timestamp", "")  # exact frame timestamp
 
 char_list = []
 if character_names:
+    # first_seen / appearances are not tracked per-character in the current pipeline:
+    # --character-names is a flat id→name map; Vision does not tag individual frames
+    # with character IDs. Both fields are set to "n/d" to make the gap explicit in
+    # the report rather than leaving an invisible missing key.
+    print("   NOTE: per-frame character tracking not available — "
+          "first_seen/appearances set to n/d", flush=True)
     for cid_str, name in sorted(character_names.items(),
                                  key=lambda x: int(x[0]) if x[0].isdigit() else 0):
         char_list.append({
             "character_id": int(cid_str) if cid_str.isdigit() else cid_str,
             "name": name,
+            "first_seen": "n/d",
+            "appearances": "n/d",
         })
 
 # ── Process intermediate_nodes ────────────────────────────────────────────────
@@ -297,6 +330,10 @@ nodes_after = len(intermediate_nodes)
 for idx, node in enumerate(intermediate_nodes):
     node["node_id"] = f"n_{idx:04d}"
 
+for node in intermediate_nodes:
+    if "source" not in node:
+        node["source"] = "audio"
+
 # C) Keywords  D) Embedding hint
 chars_clean_total = 0
 for node in intermediate_nodes:
@@ -318,6 +355,19 @@ for ci in range(0, len(intermediate_nodes), CLUSTER_SIZE):
         "node_ids":   [n["node_id"] for n in group],
     })
 
+def _build_language_note(meta):
+    lang     = meta.get("language_detected", "unknown")
+    forced   = meta.get("language_forced")
+    prob     = meta.get("language_detection_prob")
+    if forced:
+        return f"impostata manualmente: {lang}"
+    if prob is not None:
+        pct = round(prob * 100)
+        if pct < 60:
+            return f"rilevata automaticamente: {lang} ({pct}% — bassa confidenza, verificare)"
+        return f"rilevata automaticamente: {lang} ({pct}%)"
+    return f"rilevata automaticamente: {lang}"
+
 # ── Overwrite intermediate_nodes.json with enriched nodes ─────────────────────
 nodes_path = os.path.join(args.work_dir, "intermediate_nodes.json")
 with open(nodes_path, "w", encoding="utf-8") as f:
@@ -327,6 +377,10 @@ with open(nodes_path, "w", encoding="utf-8") as f:
 report = {
     "schema_version": "2.0",
     "generated_by": "video-analyzer skill",
+    "disclaimers": {
+        "audio": "Testo trascritto da Whisper: verificabile riascoltando il video originale.",
+        "vision": "Descrizioni visive generate da Claude Vision analizzando singoli fotogrammi: inferenza automatica, può contenere errori di interpretazione.",
+    },
     "metadata": metadata,
     "global_index": global_index,
     "characters": {
@@ -336,8 +390,15 @@ report = {
     },
     "rag_timeline": intermediate_nodes,
     "audio": {
-        "has_audio": bool(transcript_segments),
-        "language_detected": metadata.get("language_detected", "unknown"),
+        "has_audio": bool(transcript_segments) or (
+            bool(transcript_raw)
+            and transcript_raw not in ("NO_AUDIO", "")
+            and not transcript_raw.startswith("TRANSCRIPTION_ERROR")
+        ),
+        "language_detected":       metadata.get("language_detected", "unknown"),
+        "language_forced":         metadata.get("language_forced"),
+        "language_detection_prob": metadata.get("language_detection_prob"),
+        "language_note":           _build_language_note(metadata),
         "transcript_segments": transcript_segments,
     },
     "visual_timeline": visual_timeline,

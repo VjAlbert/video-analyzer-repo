@@ -82,21 +82,22 @@ pip3 install openai-whisper opencv-python-headless numpy Pillow \
 
 python3 /home/claude/video-analyzer/scripts/process_video.py \
     "<VIDEO_PATH>" \
-    --fps 0.5 \
-    --max-frames 30 \
     --output-dir /tmp/video_work \
     --model large-v3-turbo
 ```
 
+Frame sampling is **automatic and adaptive** — no configuration required.
+`process_video.py` scans the video at 0.25 s intervals, measures visual change with
+`cv2.absdiff`, and extracts a frame only when the scene changes significantly, or at
+least every 30 s on static content (floor), capped at 60 frames (ceiling).
 Frames are resized so the long edge is at most **1568 px** (aspect ratio preserved).
-This keeps vision token cost predictable at roughly ~1,400 tokens/frame.
 
 **Parameter guide:**
 
 | Parameter | Default | When to change |
 |-----------|---------|----------------|
-| `--fps` | 0.5 | Increase for fast-cut videos (try 1.0); decrease for slow/static (try 0.2) |
-| `--max-frames` | 30 | Increase for long videos (up to 60) |
+| `--fps` | *(adaptive)* | Pass a value (e.g. `0.5`) **only** to force legacy fixed-fps extraction. A warning is logged and adaptive sampling is disabled for that run. |
+| `--max-frames` | 30 | Applies only when `--fps` is explicit. Adaptive mode uses its own internal cap (60). |
 | `--model` | large-v3-turbo | Whisper model: tiny/base/small/medium/large-v3-turbo |
 
 ---
@@ -131,6 +132,7 @@ choose the 5–8 frames for the character-counting pass below.
 ```bash
 cat /tmp/video_work/metadata.json
 cat /tmp/video_work/transcript.txt
+cat /tmp/video_work/transcript_segments.json   # confidence scores per segment (avg_logprob, confidence, low_confidence)
 cat /tmp/video_work/clusters.json   # omit if Step 2 was skipped
 cat /tmp/video_work/manifest.json
 ```
@@ -214,11 +216,27 @@ Example values:
 
 ## Step 7 — Build the Markdown report
 
-Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
+Save to `/mnt/user-data/outputs/<basename>_report.md` using this template.
+
+**Confidence marking rules** (apply when writing Section 3):
+- Read `audio.transcript_segments` from the JSON report (field `low_confidence` is bool or null).
+- Count N = total segments, M = segments where `low_confidence == true`.
+- For each segment:
+  - `low_confidence: true`  → render the entire line in italic, prepend `⚠️ [trascrizione incerta]`
+  - `low_confidence: false` → render normally
+  - `low_confidence: null` or field absent → render normally but append `[confidenza non disponibile]`
+- **Never alter or omit the transcribed text** — marking is purely presentational.
 
 ```markdown
 # 📹 Video Report: <filename>
 > Auto-generato dalla skill video-analyzer.
+
+> **Trascrizione: N segmenti totali, M a bassa confidenza (da verificare manualmente)**
+>
+> **Nota sulle sorgenti:** Il testo in sezione 3 (🎤 audio) proviene dalla trascrizione
+> Whisper ed è verificabile riascoltando il video. Le descrizioni in sezione 4
+> (👁 visione) sono generate da Claude Vision su singoli fotogrammi: inferenza automatica,
+> può contenere errori.
 
 ## 1. Metadata
 | Proprietà | Valore |
@@ -241,15 +259,25 @@ Save to `/mnt/user-data/outputs/<basename>_report.md` using this template:
 |----|-----------|-------------|
 | 1  | ...        | ...         |
 
-## 3. Trascrizione Audio
-*(Timestamped — trascrizione automatica Whisper `<metadata.whisper_model>`, lingua: `<audio.language_detected>`)*
-```
-<trascrizione>
-```
+## 3. Trascrizione Audio — 🎤 sorgente: Whisper (verificabile riascoltando il video)
+*(N segmenti totali · M a bassa confidenza · Whisper `<metadata.whisper_model>` · Lingua: `<audio.language_note>`)*
 
-## 4. Timeline Visiva
+> **Trascrizione: N segmenti totali, M a bassa confidenza (da verificare manualmente) · Lingua: `<audio.language_note>`**
+>
+> *(Se `audio.language_detection_prob` < 0.60, aggiungere: "⚠️ Rilevamento lingua incerto — se il video contiene più lingue o audio poco chiaro, la trascrizione può contenere errori sistematici.")*
+
+[HH:MM:SS] Esempio di segmento normale con confidenza alta.
+*⚠️ [trascrizione incerta] [HH:MM:SS] Esempio di segmento con low_confidence: true — testo originale invariato.*
+[HH:MM:SS] Esempio di segmento senza campo confidence. [confidenza non disponibile]
+
+## 4. Timeline Visiva — 👁 sorgente: Claude Vision (interpretazione automatica di fotogrammi)
+
+> **Nota:** Le descrizioni seguenti sono generate da Claude Vision analizzando singoli
+> fotogrammi estratti dal video. Si tratta di inferenza automatica: può contenere errori
+> di identificazione, attribuzione o interpretazione. Non equivale alla trascrizione audio.
+
 ### [HH:MM:SS] — Scena N
-<descrizione 2-4 frasi>
+> 👁 [descrizione automatica immagine] <descrizione 2-4 frasi di cosa Claude Vision vede nel frame>
 
 ## 5. Sommario AI
 <150–300 parole>
@@ -275,7 +303,9 @@ present_files([
 
 - **No audio**: set transcript to "No audio track detected."
 - **Screen recordings**: pay attention to UI, on-screen text, window titles
-- **Fast-cut video**: `--fps 1.0`; **very long (>30 min)**: `--fps 0.1 --max-frames 60`
+- **Fast-cut video**: adaptive sampling handles this automatically; no flag needed
+- **Very long (>30 min) static video**: the 30 s floor guarantees coverage; no flag needed
+- **Override sampling**: pass `--fps 0.5` to revert to legacy fixed-fps mode (e.g. for debugging)
 - **Foreign audio**: Whisper is multilingual, no configuration needed
 - **AI-generated / animated video**: face detectors won't work; rely entirely on
   Claude Vision for character identification — this is the expected use case
@@ -302,3 +332,4 @@ present_files([
 | `transcript.txt` | Whisper transcript with `[HH:MM:SS]` markers |
 | `clusters.json` | Visual clusters from `cluster_frames.py` (optional) |
 | `intermediate_nodes.json` | Formato pivot interno da cui vengono generati tutti gli output. Non eliminare tra le esecuzioni. |
+| `transcript_segments.json` | Segmenti Whisper strutturati con punteggi di confidenza: `avg_logprob` (raw Whisper), `no_speech_prob`, `confidence` (normalizzata 0–1), `low_confidence` (bool). Letto da `build_json_report.py` per arricchire `audio.transcript_segments` nel JSON finale. Valori: `confidence` vicino a 1.0 = trascrizione affidabile; `low_confidence: true` = verificare manualmente. |

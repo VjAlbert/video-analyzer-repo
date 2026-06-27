@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -27,12 +28,51 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# ── Adaptive sampling constants ───────────────────────────────────────────────
+# Internal calibration values for the adaptive scene-change sampler.
+# These are NOT exposed as CLI flags; tweak here when recalibrating.
+#
+# SCENE_CHANGE_THRESHOLD: normalised mean pixel-difference [0–1] above which a
+#   frame is treated as a new scene. 0.30 = ignore subtle lighting shifts, catch
+#   hard cuts and major composition changes.
+SCENE_CHANGE_THRESHOLD = 0.30
+#
+# MIN_FRAME_INTERVAL_SEC: floor guarantee — extract at least one frame every N
+#   seconds even when no scene change is detected. Prevents zero coverage on
+#   long static-content videos (e.g. screencasts, lecture recordings).
+MIN_FRAME_INTERVAL_SEC = 30
+#
+# MAX_FRAMES_CAP: hard ceiling on extracted frames so a hyper-dynamic video
+#   does not inflate vision-token cost uncontrollably.
+MAX_FRAMES_CAP = 60
+#
+# SCAN_INTERVAL_SEC: step size for the cheap low-resolution pre-scan.
+#   0.25 s = 4 probes per second — fine-grained enough to catch 0.5 s cuts.
+SCAN_INTERVAL_SEC = 0.25
+
+# ── Whisper confidence constants ──────────────────────────────────────────────
+# LOW_CONFIDENCE_THRESHOLD: normalised confidence [0–1] below which a transcript
+#   segment is flagged as uncertain. Flagged segments get "low_confidence": true in
+#   the JSON report and a ⚠️ marker appended in transcript.txt for human review.
+#   The transcribed text is NEVER modified — the flag is annotation only.
+#
+#   Calibrated for large-v3-turbo: the model's practical avg_logprob range for
+#   recognised speech is [−0.2, −0.8]. The old threshold 0.40 (≈ avg_logprob −1.2)
+#   was below this range and caught nothing. 0.70 (≈ avg_logprob −0.6) marks the
+#   lower half of the model's uncertainty band as worth checking manually.
+#
+#   Structural limitation: Whisper reports avg_logprob at chunk level (~30 s decoder
+#   window), not per individual sentence. All segments within a chunk share the same
+#   value. A garbled sentence inside an otherwise-confident chunk (e.g. avg_logprob
+#   −0.33 → confidence 0.83) cannot be individually flagged via this metric.
+LOW_CONFIDENCE_THRESHOLD = 0.70
+
 # ── Args ─────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("video", help="Path to the video file")
-parser.add_argument("--fps", type=float, default=0.5,
-                    help="Deprecated: scene detection replaces fixed-fps extraction. "
-                         "Kept for backward compatibility but not used for frame sampling.")
+parser.add_argument("--fps", type=float, default=None,
+                    help="Legacy: force fixed-fps extraction (e.g. 0.5) instead of adaptive "
+                         "scene-change sampling. If omitted, adaptive sampling is used automatically.")
 parser.add_argument("--max-frames", type=int, default=30,
                     help="Hard cap on scene-change frames extracted (default 30)")
 parser.add_argument("--output-dir", default="/tmp/video_work",
@@ -51,7 +91,9 @@ args = parser.parse_args()
 VIDEO = args.video
 OUTDIR = args.output_dir
 FRAMES_DIR = os.path.join(OUTDIR, "frames")
-os.makedirs(FRAMES_DIR, exist_ok=True)
+if os.path.isdir(FRAMES_DIR):
+    shutil.rmtree(FRAMES_DIR)
+os.makedirs(FRAMES_DIR)
 
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
@@ -84,6 +126,165 @@ def find_closest_frame(anchor_secs, manifest_list):
     if not manifest_list:
         return None
     return min(manifest_list, key=lambda f: abs(f["timestamp_seconds"] - anchor_secs))
+
+
+def _whisper_confidence(avg_logprob):
+    """
+    Map Whisper's avg_logprob to a normalised confidence score in [0.0, 1.0].
+
+    avg_logprob is the mean per-token log-probability for a segment.
+    Practical range: 0.0 (every token certain) down to roughly −2.0 (very
+    uncertain speech); values below −2.0 are clamped to 0.0.
+
+    Formula: confidence = clamp(1.0 + avg_logprob / 2.0, 0.0, 1.0)
+      avg_logprob =  0.0  →  1.00  (certain)
+      avg_logprob = −1.0  →  0.50  (borderline)
+      avg_logprob = −2.0  →  0.00  (very uncertain)
+
+    Division by 2.0 spans Whisper's effective dynamic range: decoded speech
+    rarely falls below −2.0 avg_logprob; below that, no_speech_prob is
+    typically high and the segment is likely noise or silence anyway.
+
+    Returns None when avg_logprob is None (graceful degradation for Whisper
+    model versions or wrappers that do not expose the field).
+    """
+    if avg_logprob is None:
+        return None
+    return round(max(0.0, min(1.0, 1.0 + avg_logprob / 2.0)), 4)
+
+
+# ── Frame extraction helpers ──────────────────────────────────────────────────
+
+def _extract_frames_fixed_fps(video_path, frames_dir, fps_val, max_cap):
+    """
+    Legacy fixed-fps extraction via ffmpeg fps filter.
+    Used when --fps is passed explicitly, and as fallback if adaptive fails.
+    Returns (frame_filenames, timestamps).
+    """
+    pattern = os.path.join(frames_dir, "scene_%04d.jpg")
+    result = run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", (
+            f"fps={fps_val},showinfo,"
+            "scale='min(1568,iw)':'min(1568,ih)':force_original_aspect_ratio=decrease"
+        ),
+        "-q:v", "3",
+        "-frames:v", str(max_cap),
+        pattern,
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {result.stderr[-300:]}")
+    timestamps = []
+    for line in result.stderr.splitlines():
+        if "showinfo" in line or "Parsed_showinfo" in line:
+            m = re.search(r"pts_time:([\d.]+)", line)
+            if m:
+                timestamps.append(float(m.group(1)))
+    fnames = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
+    return fnames, timestamps
+
+
+def _extract_frames_adaptive(video_path, frames_dir, duration_s, max_cap=MAX_FRAMES_CAP):
+    """
+    Adaptive scene-change frame extractor using cv2.absdiff.
+
+    Pass 1 — scans the video at SCAN_INTERVAL_SEC using 160×90 greyscale
+    thumbnails to detect scene changes cheaply. A frame timestamp is selected
+    when the normalised mean of cv2.absdiff exceeds SCENE_CHANGE_THRESHOLD,
+    or when MIN_FRAME_INTERVAL_SEC has elapsed since the last saved frame.
+    Hard-capped at max_cap selected timestamps (defaults to MAX_FRAMES_CAP).
+
+    Pass 2 — extracts each selected frame at full resolution, scaled so the
+    long edge is at most 1568 px, and writes it as a JPEG (quality 85).
+
+    Raises RuntimeError if cv2 cannot open the video — the caller catches this
+    and falls back to _extract_frames_fixed_fps.
+    Returns (frame_filenames, timestamps).
+    """
+    import cv2  # noqa: PLC0415
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"cv2 cannot open video: {video_path}")
+
+    # Pass 1: low-resolution scan to collect candidate timestamps
+    selected_ts = []
+    prev_gray = None
+    last_saved_ts = -MIN_FRAME_INTERVAL_SEC  # force first frame via floor condition
+    scan_ts = 0.0
+    # Hard upper bound on scan range. Prevents infinite loop when duration_s == 0
+    # (broken/stub container) or when cv2 seek snaps to the same frame indefinitely.
+    _max_scan = duration_s if duration_s > 0 else max_cap * MIN_FRAME_INTERVAL_SEC
+
+    try:
+        while len(selected_ts) < max_cap:
+            cap.set(cv2.CAP_PROP_POS_MSEC, scan_ts * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            actual_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0  # read AFTER decode for true PTS
+
+            small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+            if prev_gray is None:
+                should_save = True
+            else:
+                diff = cv2.absdiff(gray, prev_gray)
+                norm_diff = float(diff.mean()) / 255.0
+                should_save = (
+                    norm_diff > SCENE_CHANGE_THRESHOLD
+                    or (actual_ts - last_saved_ts) >= MIN_FRAME_INTERVAL_SEC
+                )
+
+            if should_save:
+                selected_ts.append(actual_ts)
+                last_saved_ts = actual_ts
+
+            prev_gray = gray
+            scan_ts += SCAN_INTERVAL_SEC
+            if scan_ts > _max_scan + SCAN_INTERVAL_SEC:
+                break
+    finally:
+        cap.release()
+
+    if not selected_ts:
+        return [], []
+
+    # Pass 2: extract at full resolution (≤ 1568 px long edge)
+    fnames = []
+    timestamps_out = []
+    written = 0
+
+    cap2 = cv2.VideoCapture(video_path)
+    try:
+        for ts in selected_ts:
+            cap2.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+            ret, frame = cap2.read()
+            if not ret:
+                continue
+
+            h, w = frame.shape[:2]
+            if max(h, w) > 1568:
+                scale = 1568.0 / max(h, w)
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                                   interpolation=cv2.INTER_AREA)
+
+            written += 1
+            fname = f"scene_{written:04d}.jpg"
+            ok = cv2.imwrite(os.path.join(frames_dir, fname), frame,
+                             [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                print(f"    WARNING: cv2.imwrite failed for {fname} (disk full / permissions?)",
+                      flush=True)
+                written -= 1
+                continue
+            fnames.append(fname)
+            timestamps_out.append(ts)
+    finally:
+        cap2.release()
+    return fnames, timestamps_out
+
 
 # ── 1. Metadata ───────────────────────────────────────────────────────────────
 print("[1/5] Extracting metadata …", flush=True)
@@ -124,51 +325,50 @@ with open(os.path.join(OUTDIR, "metadata.json"), "w") as f:
     json.dump(summary_meta, f, indent=2)
 print(f"    Duration: {duration_fmt}  |  {summary_meta['width']}x{summary_meta['height']}  |  {summary_meta['video_codec']}", flush=True)
 
-# ── 2. Scene detection + frame extraction ─────────────────────────────────────
-# Replaces fixed-fps sampling: ffmpeg selects frames only at visual scene changes
-# (score > 0.4). showinfo logs pts_time for each selected frame → scene_timestamps[].
-print(f"[2/5] Detecting scene changes (threshold 0.4) and extracting frames …", flush=True)
-scene_pattern = os.path.join(FRAMES_DIR, "scene_%04d.jpg")
+# ── 2. Frame extraction (adaptive by default, fixed-fps when --fps is explicit) ─
+fps_explicit = args.fps is not None
 scene_timestamps = []
 
-scene_result = run([
-    "ffmpeg", "-y", "-i", VIDEO,
-    "-vf", (
-        "select='gt(scene,0.4)',showinfo,"
-        "scale='min(1568,iw)':'min(1568,ih)':force_original_aspect_ratio=decrease"
-    ),
-    "-vsync", "vfr",
-    "-q:v", "3",
-    "-frames:v", str(max_frames),
-    scene_pattern
-])
+if fps_explicit:
+    print(f"[2/5] WARNING: Adaptive sampling disabled: explicit --fps provided. "
+          f"Using fixed {args.fps} fps …", flush=True)
+    frames, scene_timestamps = _extract_frames_fixed_fps(
+        VIDEO, FRAMES_DIR, args.fps, args.max_frames
+    )
+else:
+    print(f"[2/5] Extracting frames (adaptive scene-change: "
+          f"threshold={SCENE_CHANGE_THRESHOLD}, floor={MIN_FRAME_INTERVAL_SEC}s, "
+          f"cap={args.max_frames}) …", flush=True)
+    try:
+        frames, scene_timestamps = _extract_frames_adaptive(VIDEO, FRAMES_DIR, duration_s, max_cap=args.max_frames)
+        print(f"    Adaptive: {len(frames)} frame(s) selected", flush=True)
+    except Exception as _adapt_err:
+        print(f"    Adaptive sampling failed ({_adapt_err}) — "
+              f"falling back to fixed 0.5 fps …", flush=True)
+        frames, scene_timestamps = _extract_frames_fixed_fps(
+            VIDEO, FRAMES_DIR, 0.5, args.max_frames
+        )
 
-# showinfo writes to stderr; parse pts_time from each matching line
-for line in scene_result.stderr.splitlines():
-    if "showinfo" in line or "Parsed_showinfo" in line:
-        ts_match = re.search(r"pts_time:([\d.]+)", line)
-        if ts_match:
-            scene_timestamps.append(float(ts_match.group(1)))
-
+# Trust the filesystem — functions may return stale state on edge cases
 frames = sorted(f for f in os.listdir(FRAMES_DIR) if f.endswith(".jpg"))
 
-# Fallback: if no scene changes detected, extract a single keyframe at t=0
+# Last-resort fallback: no frames produced at all → extract one keyframe at t=0
 if not frames:
-    print("    No scene changes above threshold — extracting first keyframe as fallback …", flush=True)
+    print("    No frames produced — extracting first keyframe as fallback …", flush=True)
     fallback_path = os.path.join(FRAMES_DIR, "scene_0001.jpg")
     run([
         "ffmpeg", "-y", "-i", VIDEO,
         "-vf", "scale='min(1568,iw)':'min(1568,ih)':force_original_aspect_ratio=decrease",
         "-q:v", "3", "-frames:v", "1",
-        fallback_path
+        fallback_path,
     ])
     frames = sorted(f for f in os.listdir(FRAMES_DIR) if f.endswith(".jpg"))
     if frames:
         scene_timestamps = [0.0]
 
-if len(scene_timestamps) < len(frames):
-    print(f"    WARNING: {len(frames)} frames but only {len(scene_timestamps)} scene timestamps — "
-          f"{len(frames) - len(scene_timestamps)} frame(s) will use ts=0.0", flush=True)
+if len(scene_timestamps) != len(frames):
+    print(f"    WARNING: {len(frames)} frames but {len(scene_timestamps)} timestamps — "
+          f"manifest may contain misaligned entries", flush=True)
 
 manifest = []
 for i, fname in enumerate(frames):
@@ -182,7 +382,8 @@ for i, fname in enumerate(frames):
     })
 with open(os.path.join(OUTDIR, "manifest.json"), "w") as f:
     json.dump(manifest, f, indent=2)
-print(f"    Scene changes: {len(scene_timestamps)}  |  Frames extracted: {len(frames)}", flush=True)
+_method_label = "fixed-fps" if fps_explicit else "adaptive"
+print(f"    Method: {_method_label}  |  Frames extracted: {len(frames)}", flush=True)
 
 # ── 3. Audio ──────────────────────────────────────────────────────────────────
 print("[3/5] Extracting audio …", flush=True)
@@ -213,21 +414,67 @@ if has_audio:
         transcript = result.get("text", "").strip()
         segments = result.get("segments", [])
         language_detected = result.get("language", "it")
-        summary_meta["language_detected"] = language_detected
+        language_forced   = args.language is not None
+
+        # Language-detection probability: call detect_language() on the first 30 s
+        # of audio. The model is already loaded so this is cheap (encoder pass only).
+        # Skipped when language was forced via --language (no uncertainty to report).
+        lang_prob = None
+        if not language_forced:
+            try:
+                _audio_arr = whisper.load_audio(AUDIO_PATH)
+                _audio_arr = whisper.pad_or_trim(_audio_arr)
+                _mel = whisper.log_mel_spectrogram(_audio_arr).to(model.device)
+                _, _lp = model.detect_language(_mel)
+                if isinstance(_lp, list):
+                    _lp = _lp[0] if _lp else {}
+                lang_prob = round(float(_lp.get(language_detected, 0.0)), 4)
+            except Exception:
+                pass
+
+        summary_meta["language_detected"]       = language_detected
+        summary_meta["language_forced"]         = language_forced
+        summary_meta["language_detection_prob"] = lang_prob
         summary_meta["whisper_model"] = model_name
         with open(os.path.join(OUTDIR, "metadata.json"), "w", encoding="utf-8") as f:
             json.dump(summary_meta, f, indent=2)
 
         lines = []
+        transcript_segments_data = []
         for seg in segments:
             t0 = int(seg["start"])
             sh, srem = divmod(t0, 3600)
             smn, ss = divmod(srem, 60)
-            lines.append(f"[{sh:02d}:{smn:02d}:{ss:02d}] {seg['text'].strip()}")
+            ts_label       = f"{sh:02d}:{smn:02d}:{ss:02d}"
+            text_seg       = seg["text"].strip()
+
+            avg_logprob    = seg.get("avg_logprob")
+            no_speech_prob = seg.get("no_speech_prob")
+            confidence     = _whisper_confidence(avg_logprob)
+            low_conf       = confidence is not None and confidence < LOW_CONFIDENCE_THRESHOLD
+
+            # ⚠️ marker is appended to the .txt line for human review only;
+            # it is stripped again by build_json_report.py when reading the fallback path.
+            lines.append(f"[{ts_label}] {text_seg}" + (" ⚠️" if low_conf else ""))
+            transcript_segments_data.append({
+                "timestamp":      ts_label,
+                "text":           text_seg,
+                "avg_logprob":    round(avg_logprob,    6) if avg_logprob    is not None else None,
+                "no_speech_prob": round(no_speech_prob, 6) if no_speech_prob is not None else None,
+                "confidence":     confidence,
+                "low_confidence": low_conf,
+            })
 
         with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) if lines else transcript)
-        print(f"    Processing done ({len(transcript)} chars, {len(segments)} segments)", flush=True)
+
+        seg_path = os.path.join(OUTDIR, "transcript_segments.json")
+        with open(seg_path, "w", encoding="utf-8") as f:
+            json.dump(transcript_segments_data, f, indent=2, ensure_ascii=False)
+
+        _low_conf_n = sum(1 for s in transcript_segments_data if s.get("low_confidence"))
+        print(f"    Processing done ({len(transcript)} chars, {len(segments)} segments, "
+              f"{_low_conf_n} low-confidence)", flush=True)
     except Exception as e:
         print(f"    Whisper error: {e}", flush=True)
         with open(TRANSCRIPT_PATH, "w") as f:
@@ -328,9 +575,12 @@ if _vision_ready and vision_nodes:
         try:
             msg = _anthropic_client.messages.create(
                 model=args.vision_model,
-                max_tokens=512,
+                max_tokens=max(512, len(valid_items) * 80),
                 messages=[{"role": "user", "content": content}],
             )
+            if msg.stop_reason == "max_tokens":
+                print(f"    WARNING: Vision response truncated (max_tokens reached) "
+                      f"— some descriptions may be missing.", flush=True)
             response_text = msg.content[0].text
 
             # Parse "IMAGE_N: description | IMAGE_N+1: description | ..."
@@ -378,7 +628,7 @@ print(f"    Saved: {len(intermediate_nodes)} nodes  |  Vision resolved: {resolve
 # ── Done ──────────────────────────────────────────────────────────────────────
 print("\n✅ Pre-processing complete!", flush=True)
 print(f"   Output dir        : {OUTDIR}")
-print(f"   Frames            : {len(frames)}  (scene-change driven)")
+print(f"   Frames            : {len(frames)}  ({_method_label} sampling)")
 print(f"   Scene timestamps  : {scene_timestamps}")
 print(f"   Transcript        : {TRANSCRIPT_PATH}")
 print(f"   Intermediate nodes: {NODES_PATH}")
