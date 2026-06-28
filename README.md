@@ -17,9 +17,10 @@ substituting another model requires only changing that flag.
 
 ## Demo
 
+**Modalità integrata (Claude Code / Cowork):**
 Invoke the skill with any video path:
 
-```
+```bash
 /video-analyzer "/path/to/video.mp4"
 ```
 
@@ -75,10 +76,11 @@ Auto-installed on first run:
 - opencv-python-headless
 - numpy, Pillow
 - reportlab                (PDF renderer — fallback if weasyprint is not available)
+- anthropic                (Required for Vision API character detection and scene analysis)
 ```
 
 ```bash
-pip install openai-whisper opencv-python-headless numpy Pillow reportlab
+pip install openai-whisper opencv-python-headless numpy Pillow reportlab anthropic
 ```
 
 > **Windows**: `weasyprint` requires GTK and is not native on Windows. The `reportlab` fallback is used automatically.
@@ -132,9 +134,16 @@ Three-stage pipeline with intermediate pivot format:
                                        │  • weasyprint / rl      │
                                        └────────────┬────────────┘
                                                     │
-                             ┌──────────────────────┼──────────────────────┐
-                             ▼                      ▼                      ▼
-                      *_report.md          *_report.json          *_report.pdf
+             ┌──────────────────────────────────────┼──────────────────────────────────────┐
+             │                                      │                                      │
+┌────────────▼────────────┐            ┌────────────▼────────────┐            ┌────────────▼────────────┐
+│   build_pdf_report.py   │            │    build_md_report.py   │            │   (Genera JSON output)  │
+│  • thumbnail grid       │            │   • Markdown rendering  │            │                         │
+│  • weasyprint / rl      │            │   • formatting          │            │                         │
+└────────────┬────────────┘            └────────────┬────────────┘            └────────────┬────────────┘
+             │                                      │                                      │
+             ▼                                      ▼                                      ▼
+      *_report.pdf                             *_report.md                            *_report.json
 ```
 
 **Pivot format** — `intermediate_nodes.json` decouples extraction from report generation. Each node maps one Whisper segment to its nearest visual scene change. `visual_delta` is populated by the Vision batch when `ANTHROPIC_API_KEY` is set; otherwise nodes carry `null` and the PDF renders without thumbnails.
@@ -182,7 +191,7 @@ to `--work-dir`. `build_json_report.py` reads this file automatically if present
 Skip this step if character timeline tracking is not needed. Without it,
 `first_seen` and `appearances` are reported as `"n/d"` in the JSON output.
 
-### Step 3 — Compile the report
+### Step 3 — Compile the JSON report
 
 ```bash
 python scripts/build_json_report.py \
@@ -192,6 +201,21 @@ python scripts/build_json_report.py \
     --character-names '{"1":"Host","2":"Guest"}' \
     --summary "Brief summary of the video." \
     --key-observations '["Key point A", "Key point B"]'
+```
+
+### Step 4 — Compile the Markdown and PDF reports
+
+```bash
+# Markdown
+python scripts/build_md_report.py \
+    ./output_report.json \
+    ./output_report.md
+
+# PDF
+python scripts/build_pdf_report.py \
+    --json-report ./output_report.json \
+    --frames-dir /tmp/video_work/frames \
+    --output-dir ./
 ```
 
 ---
@@ -219,6 +243,7 @@ python scripts/build_json_report.py \
 | `detect_characters.py` | Per-frame character tracking: Vision detection (Pass 1) + Python aggregation (Pass 2) |
 | `cluster_frames.py` | Clustering HSV histogram → scene grouping |
 | `build_json_report.py` | Assembly JSON v2.0 con RAG timeline, semantic compression e global index |
+| `build_md_report.py` | Compilazione del report Markdown narrativo a partire dal JSON finale |
 | `build_pdf_report.py` | Generazione PDF con thumbnail grid e timeline visiva |
 
 ---
