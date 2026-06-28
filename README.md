@@ -1,8 +1,17 @@
-# video-analyzer (Claude Skill)
+# video-analyzer
 
-> Converts any video file into a comprehensive AI-readable report **(Markdown + JSON + PDF)** with RAG-ready timeline, Vision scene analysis, and semantic compression.
+> Converts any video file into a comprehensive AI-readable report **(Markdown + JSON + PDF)**
+> with RAG-ready timeline, Vision scene analysis, and semantic compression.
 
-This Claude Skill bridges LLM environments that do not natively support direct video uploads (such as Claude Projects). It extracts audio transcripts via Whisper, identifies visual scene changes, and structures all data into a pivot format (`intermediate_nodes.json`) consumed by downstream report generators.
+Originally built to work around the fact that Claude — and most current LLM interfaces —
+cannot ingest video files directly. The pipeline solves this by decomposing any video into
+primitives that any Vision-capable model can handle: extracted frames (JPEG), an audio
+transcript (Whisper), and structured metadata (JSON).
+
+As a result the skill is **model-agnostic**: it works with Claude, Gemini, GPT-4o, or any
+other model that accepts images and text. The Vision model is a runtime parameter
+(`--vision-model`), not a hard dependency. The default is `claude-haiku-4-5-20251001`;
+substituting another model requires only changing that flag.
 
 ---
 
@@ -98,6 +107,13 @@ Three-stage pipeline with intermediate pivot format:
                      │      .json            │
                      └───────────┬───────────┘
                                  │
+                  ┌──────────────▼──────────────┐
+                  │   detect_characters.py      │  ← optional step
+                  │  • Pass 1: Vision per frame │
+                  │  • Pass 2: Python aggregation│
+                  │  → character_appearances.json│
+                  └──────────────┬──────────────┘
+                                 │
                ┌─────────────────┴──────────────────┐
                │                                    │
    ┌───────────▼───────────┐          ┌─────────────▼────────────┐
@@ -149,6 +165,23 @@ python scripts/cluster_frames.py \
     --similarity-threshold 0.72
 ```
 
+### Step 2b — Track character appearances (optional)
+
+```bash
+python scripts/detect_characters.py \
+    --work-dir /tmp/video_work \
+    --character-names '{"1":"<Name> - <description>","2":"<Name> - <description>"}' \
+    --vision-model claude-haiku-4-5-20251001 \
+    --batch-size 10
+```
+
+Sends each extracted frame (batched) to the Vision model with the character catalog,
+records which characters are visible per frame, and writes `character_appearances.json`
+to `--work-dir`. `build_json_report.py` reads this file automatically if present.
+
+Skip this step if character timeline tracking is not needed. Without it,
+`first_seen` and `appearances` are reported as `"n/d"` in the JSON output.
+
 ### Step 3 — Compile the report
 
 ```bash
@@ -171,6 +204,8 @@ python scripts/build_json_report.py \
 | `--max-frames` | `30` | Cap on frames when `--fps` is explicit. Adaptive mode uses its own internal cap (60). |
 | `--model` | `large-v3-turbo` | Whisper model: `tiny` / `base` / `small` / `medium` / `large-v3-turbo` |
 | `--similarity-threshold` | `0.72` | Character clustering sensitivity (0–1) |
+| `--cross-verify` | *(off)* | Run a second Whisper decoding pass on low-confidence segments. Where both passes agree the flag is cleared; where they diverge the segment is marked `[trascrizioni discordanti]`. Cost: extra local CPU/GPU time proportional to the number of uncertain segments. Off by default. |
+| `--batch-size` | `10` | `detect_characters.py` only. Frames per Vision API call for character detection. |
 | `--language` | `None` (auto-detect) | Lingua audio per Whisper. Se non specificata, rilevamento automatico |
 | `--task` | `transcribe` | `transcribe` mantiene la lingua originale; `translate` traduce in inglese |
 
@@ -181,7 +216,8 @@ python scripts/build_json_report.py \
 | Script | Purpose |
 |--------|---------|
 | `process_video.py` | Estrazione frame event-driven, audio Whisper, Vision batch |
-| `cluster_frames.py` | Clustering HSV histogram → character count |
+| `detect_characters.py` | Per-frame character tracking: Vision detection (Pass 1) + Python aggregation (Pass 2) |
+| `cluster_frames.py` | Clustering HSV histogram → scene grouping |
 | `build_json_report.py` | Assembly JSON v2.0 con RAG timeline, semantic compression e global index |
 | `build_pdf_report.py` | Generazione PDF con thumbnail grid e timeline visiva |
 
@@ -205,7 +241,7 @@ python scripts/build_json_report.py \
   "generated_by": "video-analyzer skill",
   "disclaimers": {
     "audio": "Testo trascritto da Whisper: verificabile riascoltando il video originale.",
-    "vision": "Descrizioni visive generate da Claude Vision su singoli fotogrammi: inferenza automatica, può contenere errori."
+    "vision": "Descrizioni visive generate dal modello Vision su singoli fotogrammi: inferenza automatica, può contenere errori."
   },
   "metadata": {
     "filename": "video.mp4",
@@ -235,7 +271,12 @@ python scripts/build_json_report.py \
     "count": 2,
     "count_source": "claude_vision",
     "list": [
-      { "character_id": 1, "name": "Host" }
+      {
+        "character_id": 1,
+        "name": "<Name> - <description>",
+        "first_seen": "00:01:00",
+        "appearances": ["00:01:00", "00:03:30", "00:07:00"]
+      }
     ]
   },
   "rag_timeline": [
@@ -267,6 +308,18 @@ python scripts/build_json_report.py \
         "confidence": 0.8438,
         "low_confidence": false,
         "source": "audio"
+      },
+      {
+        "timestamp": "00:03:47",
+        "text": "[trascrizioni discordanti] parole incerte originali",
+        "avg_logprob": -0.891,
+        "no_speech_prob": 0.183,
+        "confidence": 0.555,
+        "low_confidence": true,
+        "source": "audio",
+        "second_pass_text": "testo molto diverso dalla prima passata",
+        "agreement": false,
+        "similarity_score": 0.3241
       }
     ]
   },
@@ -294,6 +347,12 @@ python scripts/build_json_report.py \
 - Near-duplicate segment merging with Jaccard threshold 0.85
 - Adaptive scene-change frame sampling via `cv2.absdiff` — no `--fps` configuration required; frame density follows content automatically
 - Whisper confidence scoring on every `transcript_segment`: `avg_logprob`, `no_speech_prob`, `confidence` (0–1 normalised), `low_confidence` bool
+- `detect_characters.py` — optional per-frame character tracking via two-pass approach:
+  Vision API (Pass 1) + pure Python chronological aggregation (Pass 2). Populates
+  `first_seen` and `appearances` on each character; `"n/d"` when step is skipped.
+- `--cross-verify` — optional second Whisper decoding pass (beam_size=1, temperature=0.2)
+  on `low_confidence` segments only. Adds `second_pass_text`, `agreement`, `similarity_score`
+  per verified segment. Cost: local CPU/GPU time only (no API). Off by default.
 
 ---
 
@@ -303,7 +362,7 @@ python scripts/build_json_report.py \
 The default model reduces decoder layers from 32 to 4 for significantly faster transcription with negligible accuracy loss versus `large-v3`. Multilingual support fully integrated. Translation to English available via `--task translate`. Requires ~6 GB RAM during inference — confirmed working on 16 GB systems. First run downloads ~1.6 GB to `~/.cache/whisper/`.
 
 ### Vision batch
-When `ANTHROPIC_API_KEY` is set, `process_video.py` batches scene-change frames (up to 20 per call) into Claude Vision and writes descriptions into `visual_delta` on each node. Without the key, `visual_delta` remains `null` and the PDF renders text-only. Set the key in your environment before running for full visual analysis.
+When `ANTHROPIC_API_KEY` is set, `process_video.py` batches scene-change frames (up to 20 per call) into the configured Vision model (`--vision-model`, default `claude-haiku-4-5-20251001`) and writes descriptions into `visual_delta` on each node. Without the key, `visual_delta` remains `null` and the PDF renders text-only. Set the key in your environment before running for full visual analysis.
 
 ### Adaptive frame sampling
 `process_video.py` uses an **automatic adaptive sampler** — no configuration required:
@@ -333,6 +392,44 @@ This maps Whisper's practical range (0.0 → −2.0) linearly to [1.0, 0.0]. Seg
 Confidence fields are stored in `transcript_segments.json` and forwarded to `audio.transcript_segments` in the final JSON report. Segments from old runs (no `transcript_segments.json`) fall back to the `.txt` parsing path with `low_confidence: null`.
 
 Low-confidence segments appear in italic with a `⚠️ [trascrizione incerta]` badge in the `.md` report and with grey/italic styling in the PDF.
+
+### Cross-verification (--cross-verify)
+
+When `--cross-verify` is passed, `process_video.py` runs a second independent Whisper
+decoding pass **exclusively on segments already flagged `low_confidence = True`**.
+Segments with `low_confidence = False` are never touched — zero extra compute for them.
+
+**How it works:**
+
+1. The audio slice for each uncertain segment is extracted via numpy array indexing
+   (no disk I/O — the audio array is already in memory from the language detection pass).
+2. A second `model.transcribe()` call runs on the slice with different decoding parameters:
+   `beam_size=1` (greedy) and `temperature=0.2` versus `beam_size=5, temperature=0` for
+   the first pass. The parameter difference maximises independence between the two passes.
+3. Both outputs are compared using normalised character-level edit distance
+   (`AGREEMENT_THRESHOLD = 0.75`).
+
+**Outcomes per segment:**
+
+| Result | Condition | Effect |
+|--------|-----------|--------|
+| Agreed | similarity ≥ 0.75 | `low_confidence` cleared (verification passed) |
+| Discordant | similarity < 0.75 | text prepended with `[trascrizioni discordanti]`, flag retained |
+| Failed | second pass raises exception | original flag kept, error logged, no crash |
+
+**Cost:** Whisper runs locally — no API calls, no token cost. The overhead is **local
+CPU/GPU time**: roughly one extra decode per low-confidence segment. On CPU-only machines
+this is the dominant cost; on GPU machines the overhead is smaller. For most use cases
+the first pass is sufficient; use `--cross-verify` when transcript accuracy on uncertain
+segments is critical.
+
+**New fields** (present only on cross-verified segments):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `second_pass_text` | string | Raw output of the second pass (audit only — not the authoritative transcript) |
+| `agreement` | bool | `true` when similarity ≥ 0.75 |
+| `similarity_score` | float | Normalised edit distance, 4 decimal places |
 
 ### Language detection transparency
 After transcription, `process_video.py` runs `model.detect_language()` on the first 30 s of audio (encoder-only pass — negligible cost) to obtain a per-language probability. Three fields are written to `metadata.json` and forwarded to the `audio` section of the final report:

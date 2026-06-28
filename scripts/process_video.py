@@ -13,6 +13,36 @@ Outputs (inside --output-dir):
     manifest.json             — list of frame paths + timestamps
     intermediate_nodes.json   — event-driven nodes: Whisper segments × scene change proximity,
                                 with visual_delta filled by batch Vision if ANTHROPIC_API_KEY is set
+
+── Cross-verify (--cross-verify flag) ────────────────────────────────────────────────────────────
+Whisper runs entirely on the local machine — there are no API calls and no token cost.
+The extra cost of --cross-verify is CPU/GPU processing time only.
+
+What it does:
+  For every segment already flagged low_confidence=True by the first transcription pass,
+  a second independent Whisper decode of that audio slice is run using different decoding
+  parameters (beam_size=1, temperature=0.2 vs. beam_size=5 in the first pass). The two
+  outputs are compared with a normalised character-level Levenshtein similarity score:
+
+    AGREEMENT_THRESHOLD = 0.75  — strings sharing ≥ 75% of characters (after normalisation)
+                                  are considered concordant. This tolerates minor formatting
+                                  differences (punctuation, casing) while still flagging real
+                                  divergences in word choice or hallucination.
+
+  If both passes agree  (similarity ≥ 0.75): low_confidence is cleared to False.
+  If the passes diverge (similarity <  0.75): low_confidence stays True and the segment
+    text is prefixed with "[trascrizioni discordanti]" to make the uncertainty explicit.
+
+  The field second_pass_text is stored for audit only — the authoritative output is
+  always "text". agreement and similarity_score are also added to the segment.
+
+Performance notes:
+  - Off by default. Use --cross-verify only when transcript quality matters more than speed.
+  - On a CPU-only machine each low-confidence segment adds roughly one Whisper decode
+    of that segment's duration. On a GPU machine the overhead is proportionally smaller.
+  - Segments with low_confidence=False are never re-decoded: the extra compute scales
+    only with the number of uncertain segments, not the total video length.
+──────────────────────────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -67,6 +97,20 @@ SCAN_INTERVAL_SEC = 0.25
 #   −0.33 → confidence 0.83) cannot be individually flagged via this metric.
 LOW_CONFIDENCE_THRESHOLD = 0.70
 
+# ── Cross-verify constants ────────────────────────────────────────────────────
+# CROSS_VERIFY_BEAM_SIZE: beam_size for the second Whisper decoding pass.
+#   First pass uses beam_size=5 (wider search tree, higher quality, more compute).
+#   Second pass uses beam_size=1 (greedy decoding) — a fundamentally different
+#   search strategy so agreement between the two is meaningful signal, not a
+#   deterministic re-run of the same path.
+CROSS_VERIFY_BEAM_SIZE = 1
+#
+# AGREEMENT_THRESHOLD: normalised similarity [0.0–1.0] at or above which two
+#   transcription outputs are considered concordant. 0.75 tolerates minor
+#   Whisper formatting differences (punctuation, casing) while catching meaningful
+#   divergences in word choice or hallucination.
+AGREEMENT_THRESHOLD = 0.75
+
 # ── Args ─────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("video", help="Path to the video file")
@@ -86,6 +130,18 @@ parser.add_argument("--language", default=None,
                          "Leave unset to let Whisper auto-detect (default).")
 parser.add_argument("--vision-model", default="claude-haiku-4-5-20251001",
                     help="Claude model used for Vision batch (default claude-haiku-4-5-20251001)")
+parser.add_argument(
+    "--cross-verify",
+    action="store_true",
+    default=False,
+    help=(
+        "Run a second Whisper decoding pass on low-confidence segments using "
+        "different parameters (beam_size, temperature). Segments where both "
+        "passes agree have low_confidence cleared; segments where they diverge "
+        "are flagged '[trascrizioni discordanti]'. Increases CPU/GPU time "
+        "proportionally to the number of low-confidence segments. Default: off."
+    ),
+)
 args = parser.parse_args()
 
 VIDEO = args.video
@@ -151,6 +207,24 @@ def _whisper_confidence(avg_logprob):
     if avg_logprob is None:
         return None
     return round(max(0.0, min(1.0, 1.0 + avg_logprob / 2.0)), 4)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Normalised character-level Levenshtein similarity in [0.0, 1.0].
+    Returns 1.0 for identical strings, 0.0 when one is empty and the other is not.
+    Normalised by max(len(a), len(b)) to be length-independent."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    m, n = len(a), len(b)
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        curr = [i] + [0] * n
+        for j in range(1, n + 1):
+            curr[j] = prev[j - 1] if a[i - 1] == b[j - 1] else 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+    return round(1.0 - prev[n] / max(m, n), 4)
 
 
 # ── Frame extraction helpers ──────────────────────────────────────────────────
@@ -464,6 +538,84 @@ if has_audio:
                 "confidence":     confidence,
                 "low_confidence": low_conf,
             })
+
+        # ── Cross-verify pass (--cross-verify only) ──────────────────────────────
+        # Whisper runs locally — the extra cost here is CPU/GPU time, not API calls
+        # or money. Each low-confidence segment triggers one additional Whisper decode
+        # of that segment's duration. The block is entirely skipped without the flag.
+        if args.cross_verify and transcript_segments_data:
+            _cv_indices = [
+                i for i, s in enumerate(transcript_segments_data)
+                if s.get("low_confidence") is True
+            ]
+            if not _cv_indices:
+                print("    Cross-verify: no low-confidence segments found — nothing to verify.", flush=True)
+            else:
+                print(f"    Cross-verify: re-decoding {len(_cv_indices)} low-confidence "
+                      f"segment(s) …", flush=True)
+                # Load the full untruncated audio array for slicing.
+                # The array used for language detection was pad_or_trimmed to 30 s
+                # and cannot be reused for arbitrary-position segment slicing here.
+                _full_audio = None
+                try:
+                    _full_audio = whisper.load_audio(AUDIO_PATH)
+                except Exception as _la_err:
+                    print(f"    Cross-verify: could not load audio array ({_la_err}) — "
+                          f"skipping all cross-verify.", flush=True)
+                if _full_audio is not None:
+                    _sr = whisper.audio.SAMPLE_RATE  # 16000 Hz
+                    n_verified = n_agreed = n_disagreed = n_failed = 0
+                    for _cv_idx in _cv_indices:
+                        _sd       = transcript_segments_data[_cv_idx]
+                        _orig_seg = segments[_cv_idx]
+                        _start_s  = float(_orig_seg["start"])
+                        _end_s    = float(_orig_seg["end"])
+                        _ts_lbl   = _sd["timestamp"]
+                        try:
+                            _slice = _full_audio[int(_sr * _start_s):int(_sr * _end_s)]
+                            if _slice.size == 0:
+                                raise ValueError("empty audio slice (start >= end or beyond file)")
+                            # Second pass: beam_size=CROSS_VERIFY_BEAM_SIZE (greedy, =1) with
+                            # temperature=0.2.  beam_size=1 is intentionally different from the
+                            # first pass (beam_size=5) so the two passes explore different
+                            # decoding paths — agreement between them is meaningful signal.
+                            _r2 = model.transcribe(
+                                _slice,
+                                task=args.task,
+                                language=language_detected,
+                                fp16=False,
+                                verbose=False,
+                                beam_size=CROSS_VERIFY_BEAM_SIZE,
+                                temperature=0.2,
+                            )
+                            _txt2 = _r2.get("text", "").strip()
+                            # Normalise before comparison: lowercase, collapse whitespace.
+                            # Punctuation is retained — it carries semantic disagreement signal.
+                            _n1 = " ".join(_sd["text"].lower().split())
+                            _n2 = " ".join(_txt2.lower().split())
+                            _sim     = _text_similarity(_n1, _n2)
+                            _agreed  = _sim >= AGREEMENT_THRESHOLD
+                            _sd["second_pass_text"] = _txt2
+                            _sd["agreement"]        = _agreed
+                            _sd["similarity_score"] = _sim
+                            if _agreed:
+                                _sd["low_confidence"] = False
+                                # Rebuild line without ⚠️ — segment is now considered reliable.
+                                lines[_cv_idx] = f"[{_ts_lbl}] {_sd['text']}"
+                                n_agreed += 1
+                            else:
+                                _sd["low_confidence"] = True
+                                _sd["text"] = "[trascrizioni discordanti] " + _sd["text"]
+                                lines[_cv_idx] = f"[{_ts_lbl}] {_sd['text']} ⚠️"
+                                n_disagreed += 1
+                            n_verified += 1
+                        except Exception as e:
+                            print(f"    cross-verify failed for segment {_ts_lbl}: {e}", flush=True)
+                            n_failed += 1
+                    print(f"    Cross-verify: {n_verified} segment(s) processed | "
+                          f"{n_agreed} agreed (flag cleared) | "
+                          f"{n_disagreed} discordant (strongly uncertain) | "
+                          f"{n_failed} failed (original flag retained)", flush=True)
 
         with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) if lines else transcript)

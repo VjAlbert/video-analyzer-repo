@@ -295,15 +295,20 @@ def _build_html(report, nodes, thumbnails, today_str):
     # ── Section 2 — Characters ────────────────────────────────────────────────
     parts.append("<div class='section'><h2>2. Personaggi</h2>"
                  "<table class='data'><tr>"
-                 "<th>ID</th><th>Nome</th><th>Prima apparizione</th><th>Apparizioni</th>"
+                 "<th>ID</th><th>Nome / Descrizione</th><th>Prima apparizione</th><th>Apparizioni</th>"
                  "</tr>")
     if chars:
         for c in chars:
             cid         = h(str(c.get("character_id", "–")))
-            name        = h(str(c.get("name",          "–")))
+            fullname    = str(c.get("name", "–"))
+            if " - " in fullname:
+                name_part, desc_part = fullname.split(" - ", 1)
+                name_html = f"<b>{h(name_part.strip())}</b><br/><span style='font-size: 8pt; color: #555;'>{h(desc_part.strip())}</span>"
+            else:
+                name_html = h(fullname)
             first_seen  = h(str(c.get("first_seen",    "—")))
             appearances = h(str(c.get("appearances",   "—")))
-            parts.append(f"<tr><td>{cid}</td><td>{name}</td><td>{first_seen}</td><td>{appearances}</td></tr>")
+            parts.append(f"<tr><td>{cid}</td><td>{name_html}</td><td>{first_seen}</td><td>{appearances}</td></tr>")
     else:
         parts.append("<tr><td colspan='4' style='color:#888'>"
                      "Nessun personaggio identificato.</td></tr>")
@@ -483,6 +488,12 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
     DISCLAIMER  = _RL_PS("va_disclaimer", parent=BODY,  fontSize=8,
                           leftIndent=8,   rightIndent=8, spaceBefore=4, spaceAfter=10,
                           leading=12)
+    TABLE_HEADER = _RL_PS("va_table_header", parent=styles["Normal"],
+                          fontSize=9, fontName="Helvetica-Bold",
+                          textColor=_RL_COLORS.white)
+    TABLE_BODY   = _RL_PS("va_table_body", parent=styles["Normal"],
+                          fontSize=9, fontName="Helvetica",
+                          textColor=DARK, leading=11)
 
     page_w = doc.width
     story  = []
@@ -512,29 +523,34 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
     ht = meta.get("height") or "–"
     n_scenes = len([n for n in nodes if n.get("visual_delta") is not None])
     meta_data = [
-        ["Proprietà", "Valore"],
-        ["Filename",              filename],
-        ["Durata",                duration],
-        ["Risoluzione",           f"{w}×{ht}"],
-        ["FPS originale",         str(meta.get("fps_original") or "–")],
-        ["Codec video",           str(meta.get("video_codec",  "–"))],
-        ["Codec audio",           str(meta.get("audio_codec",  "–"))],
-        ["Dimensione",            f"{meta.get('size_mb', '–')} MB"],
-        ["Lingua",                lang_note_rl],
-        ["Personaggi",            str(report.get("characters", {}).get("count", 0))],
-        ["Scene con delta visivo",str(n_scenes)],
+        [_RL_P("Proprietà", TABLE_HEADER), _RL_P("Valore", TABLE_HEADER)]
     ]
-    meta_tbl = _RL_TABLE(meta_data, colWidths=[0.40*page_w, 0.60*page_w])
+    for prop, val in [
+        ("Filename",              filename),
+        ("Durata",                duration),
+        ("Risoluzione",           f"{w}×{ht}"),
+        ("FPS originale",         str(meta.get("fps_original") or "–")),
+        ("Codec video",           str(meta.get("video_codec",  "–"))),
+        ("Codec audio",           str(meta.get("audio_codec",  "–"))),
+        ("Dimensione",            f"{meta.get('size_mb', '–')} MB"),
+        ("Lingua",                lang_note_rl),
+        ("Personaggi",            str(report.get("characters", {}).get("count", 0))),
+        ("Scene con delta visivo",str(n_scenes)),
+    ]:
+        meta_data.append([
+            _RL_P(_xe(prop), TABLE_BODY),
+            _RL_P(_xe(val), TABLE_BODY)
+        ])
+    meta_tbl = _RL_TABLE(meta_data, colWidths=[0.35*page_w, 0.65*page_w])
     meta_tbl.setStyle(_RL_TS([
         ("BACKGROUND",   (0, 0), (-1, 0), DARK),
-        ("TEXTCOLOR",    (0, 0), (-1, 0), _RL_COLORS.white),
-        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1,-1), 9),
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
         ("ROWBACKGROUNDS",(0,1), (-1,-1), [_RL_COLORS.white, _RL_COLORS.HexColor("#f8f8f8")]),
         ("GRID",         (0, 0), (-1,-1), 0.5, _RL_COLORS.HexColor("#dddddd")),
-        ("TOPPADDING",   (0, 0), (-1,-1), 4),
-        ("BOTTOMPADDING",(0, 0), (-1,-1), 4),
+        ("TOPPADDING",   (0, 0), (-1,-1), 5),
+        ("BOTTOMPADDING",(0, 0), (-1,-1), 5),
         ("LEFTPADDING",  (0, 0), (-1,-1), 6),
+        ("RIGHTPADDING", (0, 0), (-1,-1), 6),
     ]))
     story.append(meta_tbl)
     story.append(_RL_SP(0, 14))
@@ -542,27 +558,42 @@ def _build_pdf_reportlab(report, nodes, thumbnails, output_path, today_str):
     # ── Section 2 — Characters ────────────────────────────────────────────────
     story.append(_RL_P("2. Personaggi", H2))
     story.append(_RL_HR(width="100%", color=ACCENT, thickness=1, spaceAfter=8))
-    char_data = [["ID", "Nome", "Prima app.", "Apparizioni"]]
+    char_data = [[
+        _RL_P("ID", TABLE_HEADER),
+        _RL_P("Nome / Descrizione", TABLE_HEADER),
+        _RL_P("Prima app.", TABLE_HEADER),
+        _RL_P("Apparizioni", TABLE_HEADER)
+    ]]
     for c in chars:
+        fullname = str(c.get("name", "–"))
+        if " - " in fullname:
+            name, desc = fullname.split(" - ", 1)
+            display_html = f"<b>{_xe(name.strip())}</b><br/><font size=8 color='#555555'>{_xe(desc.strip())}</font>"
+        else:
+            display_html = _xe(fullname)
         char_data.append([
-            str(c.get("character_id", "–")),
-            str(c.get("name",          "–")),
-            str(c.get("first_seen",    "—")),
-            str(c.get("appearances",   "—")),
+            _RL_P(_xe(str(c.get("character_id", "–"))), TABLE_BODY),
+            _RL_P(display_html, TABLE_BODY),
+            _RL_P(_xe(str(c.get("first_seen", "—"))), TABLE_BODY),
+            _RL_P(_xe(str(c.get("appearances", "—"))), TABLE_BODY)
         ])
     if not chars:
-        char_data.append(["–", "Nessun personaggio identificato", "–", "–"])
-    char_tbl = _RL_TABLE(char_data, colWidths=[0.12*page_w, 0.42*page_w, 0.23*page_w, 0.23*page_w])
+        char_data.append([
+            _RL_P("–", TABLE_BODY),
+            _RL_P("Nessun personaggio identificato", TABLE_BODY),
+            _RL_P("–", TABLE_BODY),
+            _RL_P("–", TABLE_BODY)
+        ])
+    char_tbl = _RL_TABLE(char_data, colWidths=[0.08*page_w, 0.58*page_w, 0.17*page_w, 0.17*page_w])
     char_tbl.setStyle(_RL_TS([
         ("BACKGROUND",   (0, 0), (-1, 0), DARK),
-        ("TEXTCOLOR",    (0, 0), (-1, 0), _RL_COLORS.white),
-        ("FONTNAME",     (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",     (0, 0), (-1,-1), 9),
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
         ("ROWBACKGROUNDS",(0,1), (-1,-1), [_RL_COLORS.white, _RL_COLORS.HexColor("#f8f8f8")]),
         ("GRID",         (0, 0), (-1,-1), 0.5, _RL_COLORS.HexColor("#dddddd")),
-        ("TOPPADDING",   (0, 0), (-1,-1), 4),
-        ("BOTTOMPADDING",(0, 0), (-1,-1), 4),
+        ("TOPPADDING",   (0, 0), (-1,-1), 5),
+        ("BOTTOMPADDING",(0, 0), (-1,-1), 5),
         ("LEFTPADDING",  (0, 0), (-1,-1), 6),
+        ("RIGHTPADDING", (0, 0), (-1,-1), 6),
     ]))
     story.append(char_tbl)
     story.append(_RL_SP(0, 14))

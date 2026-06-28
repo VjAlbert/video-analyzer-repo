@@ -175,6 +175,9 @@ transcript_raw       = read_text(os.path.join(args.work_dir, "transcript.txt"))
 _vt_auto_raw         = read_json(os.path.join(args.work_dir, "visual_timeline_auto.json"))
 visual_timeline_auto = _vt_auto_raw if isinstance(_vt_auto_raw, list) else []
 
+_char_app_raw = read_json(os.path.join(args.work_dir, "character_appearances.json"))
+character_appearances = _char_app_raw if isinstance(_char_app_raw, dict) else {}
+
 _raw_nodes = read_json(os.path.join(args.work_dir, "intermediate_nodes.json"))
 intermediate_nodes = _raw_nodes if isinstance(_raw_nodes, list) else []
 
@@ -245,15 +248,26 @@ if character_names:
     # --character-names is a flat id→name map; Vision does not tag individual frames
     # with character IDs. Both fields are set to "n/d" to make the gap explicit in
     # the report rather than leaving an invisible missing key.
-    print("   NOTE: per-frame character tracking not available — "
-          "first_seen/appearances set to n/d", flush=True)
+    if not character_appearances:
+        print("   NOTE: per-frame character tracking not available — "
+              "first_seen/appearances set to n/d", flush=True)
+    else:
+        print(f"   Character appearances loaded: {len(character_appearances)} "
+              f"character(s) tracked", flush=True)
     for cid_str, name in sorted(character_names.items(),
                                  key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+        _app_data = character_appearances.get(cid_str, {})
+        _raw_app  = _app_data.get("appearances", "n/d")
+        # detect_characters.py writes appearances as a list; normalise to a
+        # human-readable string so PDF/MD renderers don't get Python list repr.
+        if isinstance(_raw_app, list):
+            _raw_app = (f"{len(_raw_app)} ({', '.join(str(t) for t in _raw_app)})"
+                        if _raw_app else "n/d")
         char_list.append({
             "character_id": int(cid_str) if cid_str.isdigit() else cid_str,
             "name": name,
-            "first_seen": "n/d",
-            "appearances": "n/d",
+            "first_seen":  _app_data.get("first_seen",  "n/d"),
+            "appearances": _raw_app,
         })
 
 # ── Process intermediate_nodes ────────────────────────────────────────────────
